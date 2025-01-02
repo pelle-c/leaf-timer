@@ -8,7 +8,7 @@
 #include "AsyncTCP.h"
 #include <ctime>
 
-#include "index_html.cpp"
+#include "html_templates.cpp"
 
 AsyncWebServer server(80);
 
@@ -17,14 +17,15 @@ const char *password = "0123456789";
 
 CAN_device_t CAN_cfg;               // CAN Config
 unsigned long previousMillis = 0;   // will store last time a CAN Message was send
-const int interval_can = 100;          // interval_can at which send CAN Messages (milliseconds)
-const int interval_bat = 50;          // n * interval_can at which send CAN Messages to battery for detailed info
+const int interval_can = 100;       // interval_can at which send CAN Messages (milliseconds)
+const int interval_bat = 50;        // n * interval_can at which send CAN Messages to battery for detailed info
 const int rx_queue_size = 10;       // Receive Queue size
 
 #define CAN_SE_PIN 23
 #define LED_BUILTIN 2 
 
 void setup() {
+  init_time();
   Serial.begin(115200);
   Serial.println();
   Serial.println("Starting Leaf timer");
@@ -32,14 +33,10 @@ void setup() {
   init_ap();
   init_can();
   init_webserver();
-  init_time();
 }
 
 
 void init_time() {
-  struct timeval tv;
-  tv.tv_sec =   1735804800;
-  settimeofday(&tv, NULL);
   setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/ 3", 1); // https://www.gnu.org/software/libc/manual/html_node/TZ-Variable.html
   tzset();
 }
@@ -185,32 +182,65 @@ void loop() {
   }
 }
 
+void notFound(AsyncWebServerRequest* request) {
+  request->send(404, "text/plain", "Not found");
+}
+
 void init_webserver() {
 
-  server.on("/logout", HTTP_GET, [](AsyncWebServerRequest* request) { request->send(401); });
-
-  // Route for root / web page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send_P(200, "text/html", index_html, processor);
   });
 
-  // Start server
+  server.on("/timer", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", timer_html, processor);
+  });
+
+  server.on("/clock", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", clock_html, processor);
+  });
+
+  server.on("/clock_set", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("timestamp")) {
+      String timestamp_str = request->getParam("timestamp")->value() + "\x00";
+      char* timestamp_char = new char[10];
+      std::copy(timestamp_str.begin(),timestamp_str.end() + 1,timestamp_char);
+      float timestamp = atof(timestamp_char);
+      Serial.printf("ts1:%s\n",timestamp_char);
+      Serial.printf("ts2:%.2f\n",timestamp);
+      struct timeval tv;
+//      time_t now;
+      tv.tv_sec = 1735838204; 
+      tv.tv_usec = 0; 
+      settimeofday(&tv, NULL);
+    } else {
+      request->send(200, "text/plain", "No timestamp found in request");
+    }
+    request->send(200, "text/plain", "Clock set!");
+//    request->send_P(200, "text/html", index_html, processor);
+  });
+
+/*
+*/
+
+  server.onNotFound(notFound);
+
   server.begin();
 }
 
 String processor(const String& var)
 {
-
-  time_t now;
-  char strftime_buf[64];
-  struct tm timeinfo;
-
-  Serial.printf("Var:%s\n",var);
+  if(var == "LINKS") {
+    String content = "<a href='/' class='button'>Overview</a>&nbsp;<a href='/timer' class='button'>Set timer</a>&nbsp;<a href='/clock' class='button'>Set clock</a>";
+    return content;
+  }
   if(var == "CLOCK") {
     String content = "";
+    time_t now;
+    char strftime_buf[64];
+    struct tm timeinfo;
+
     time(&now);
-    setenv("TZ", "GMT+1", 1);
-    tzset();
     localtime_r(&now, &timeinfo);
     strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
     content += "Time: " + String(strftime_buf) + "<br>";
