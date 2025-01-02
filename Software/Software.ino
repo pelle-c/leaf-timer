@@ -27,15 +27,24 @@ const int rx_queue_size = 10;       // Receive Queue size
 void setup() {
   Serial.begin(115200);
   Serial.println();
+  Serial.println("Starting Leaf timer");
   Serial.println("Configuring access point...");
-  if (!WiFi.softAP(ssid, password)) {
-    Serial.println("Soft AP creation failed.");
-    while (1);
-  }
-  IPAddress myIP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
-  Serial.println(myIP);
+  init_ap();
+  init_can();
+  init_webserver();
+  init_time();
+}
 
+
+void init_time() {
+  struct timeval tv;
+  tv.tv_sec =   1735804800;
+  settimeofday(&tv, NULL);
+  setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/ 3", 1); // https://www.gnu.org/software/libc/manual/html_node/TZ-Variable.html
+  tzset();
+}
+
+void init_can() {
   pinMode(CAN_SE_PIN, OUTPUT);
   digitalWrite(CAN_SE_PIN, LOW);
   CAN_cfg.speed = CAN_SPEED_500KBPS;
@@ -43,10 +52,17 @@ void setup() {
   CAN_cfg.rx_pin_id = GPIO_NUM_26;
   CAN_cfg.rx_queue = xQueueCreate(rx_queue_size, sizeof(CAN_frame_t));
   ESP32Can.CANInit();
-  Serial.println("Starting Leaf timer");
-  init_webserver();
 }
 
+void init_ap() {
+  if (!WiFi.softAP(ssid, password)) {
+    Serial.println("Soft AP creation failed.");
+    while (1);
+  }
+  IPAddress myIP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(myIP);
+}
 
 char status_plugged_in = 0;
 char status_charging = 0;
@@ -63,7 +79,6 @@ unsigned long last_group_request_millis = 0;
 void loop() {
 
   CAN_frame_t rx_frame;  
-
 
   unsigned long currentMillis = millis();
 
@@ -185,10 +200,29 @@ void init_webserver() {
 
 String processor(const String& var)
 {
+
+  time_t now;
+  char strftime_buf[64];
+  struct tm timeinfo;
+
   Serial.printf("Var:%s\n",var);
-  if(var == "X") {
+  if(var == "CLOCK") {
+    String content = "";
+    time(&now);
+    setenv("TZ", "GMT+1", 1);
+    tzset();
+    localtime_r(&now, &timeinfo);
+    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+    content += "Time: " + String(strftime_buf) + "<br>";
+    return content;
+  } 
+  if(var == "SOC") {
     String content = "";
     content += "SoC: " + String(soc) + "&#37;<br>";
+    return content;
+  } 
+  if(var == "SOH") {
+    String content = "";
     content += "SoH: " + String(soh) + "&#37;<br>";
     return content;
   } 
