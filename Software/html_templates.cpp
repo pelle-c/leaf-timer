@@ -21,12 +21,14 @@ a.button {
 %CLOCK%
 %CAN_DATA%
 %TIMER%<br>
+<div id="status" %DIV_STATUS_STYLE%>
 %SOC%<br>
 %SOH%<br>
 %CAR_OFF%<br>
 %PLUGGED_IN%<br>
 %CHARGING%<br>
 %HV_STATUS%
+</div>
 </body>
 )rawliteral";
 

@@ -330,6 +330,15 @@ String processor(const String& var)
     String content = "<a href='/' class='button'>Overview</a>&nbsp;<a href='/timer' class='button'>Set timer</a>&nbsp;<a href='/clock' class='button'>Set clock</a>&nbsp;<a href='/control' class='button'>Control</a><br><hr>";
     return content;
   }
+
+  if(var == "DIV_STATUS_STYLE") {
+    String content = "";
+    if (timestamp_last_can_received == 0) {
+      content = "style='display: none;'";
+    }
+    return content;
+  } 
+
   if(var == "CLOCK") {
     String content = "";
     time_t now;
@@ -371,10 +380,14 @@ String processor(const String& var)
   if(var == "CAN_DATA") {
     String content = "";
     String font_p = "<p style='color:MediumSeaGreen;'>";
-    if (seconds_since_can_data(timestamp_last_can_received) > 60) {
+    if ((seconds_since_can_data(timestamp_last_can_received) > 60) or (timestamp_last_can_received == 0)) {
       font_p = "<p style='color:red;'>";
     }
-    content += String(font_p) + "Last can message seen: " + String(seconds_since_can_data(timestamp_last_can_received)) + "s ago</p>";
+    if (timestamp_last_can_received == 0) {
+      content += String(font_p) + "No can messages seen yet</p>";
+    } else {
+      content += String(font_p) + "Last can message seen: " + String(seconds_since_can_data(timestamp_last_can_received)) + "s ago</p>";
+    }
     return content;
   } 
   if(var == "TIMER") {
