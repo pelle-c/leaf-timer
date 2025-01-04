@@ -24,10 +24,10 @@ a.button {
 <div id="status" %DIV_STATUS_STYLE%>
 %SOC%<br>
 %SOH%<br>
-%CAR_OFF%<br>
 %PLUGGED_IN%<br>
 %CHARGING%<br>
-%HV_STATUS%
+%HV_STATUS%<br>
+%BATTERY_TYPE%
 </div>
 </body>
 )rawliteral";
@@ -93,6 +93,13 @@ a.button {
 <body>
 <h1>Leaf charging timer - Control</h1>
 %LINKS%<br>
-<a href='/start_charging' class='button'>Start charging</a>&nbsp;<a href='/stop_charging' class='button'>Stop charging</a>&nbsp<a href='/wake_up' class='button'>Wake up</a>
+<a href='/start_charging' class='button'>Start charging</a>&nbsp;<a href='/stop_charging' class='button'>Stop charging</a>&nbsp<a href='/wake_up' class='button'>Wake up VCM</a>&nbsp<a href='/sleep' class='button'>VCM Sleep</a>
+<br><br>
+<div align="left">
+<li>"Start charging" will send multiple can messages, emulating a remote command from Nissan Carwings. The VCM needs to be awake (can-bus is active).<br></li>
+<li>"Stop charging" will send multiple can messages, emulating a battery full message from the LBC. After this, the VCM has to go to sleep before starting to charge again.</li>
+<li>"Wake up VCM" will pull a pin on the VCM to +12V, emulating a remote wake-up command from the TCU. After this, the VCM will start sending messages.
+<li>"VCM Sleep" will pull a pin on the VCM to 0V. The VCM will not go to sleep right away.
+<div>
 </body>
 )rawliteral";

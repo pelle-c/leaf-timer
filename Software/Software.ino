@@ -7,22 +7,35 @@
 #include "ESPAsyncWebServer.h"
 #include "AsyncTCP.h"
 #include <ctime>
+#include <Adafruit_NeoPixel.h>
 
 #include "html_templates.cpp"
 
-AsyncWebServer server(80);
 
 const char *ssid = "lily";
 const char *password = "0123456789";
 
+AsyncWebServer server(80);
+
 CAN_device_t CAN_cfg;               // CAN Config
 unsigned long previousMillis = 0;   // will store last time a CAN Message was send
-const int interval_can = 100;       // interval_can at which send CAN Messages (milliseconds)
+const int interval_can = 100;       // at which interval to send CAN Messages (milliseconds)
 const int interval_bat = 50;        // n * interval_can at which send CAN Messages to battery for detailed info
 const int rx_queue_size = 10;       // Receive Queue size
 
 #define CAN_SE_PIN 23
-#define LED_BUILTIN 2 
+#define WAKE_UP_PIN 25
+
+#define LED_PIN 4
+#define PIXEL 0
+#define NUMPIXELS 1
+Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+#define LEAF_ZE0 0
+#define LEAF_AZE0 1
+#define LEAF_ZE1 2
+
+int state_wake_up_pin = 0;
 
 void setup() {
   init_time();
@@ -33,6 +46,36 @@ void setup() {
   init_ap();
   init_can();
   init_webserver();
+  pinMode(WAKE_UP_PIN, OUTPUT);  
+  clear_wake_up();
+  blink_led();
+}
+
+void blink_led() {
+  pixels.begin();
+  pixels.clear();
+  //int PIXEL = 0;
+  for(int i=0; i<200; i++) {
+    pixels.setPixelColor(PIXEL, pixels.Color(0, i, 0));
+    pixels.show();
+    delay(2);
+  }
+  for(int i=200; i>-1; i--) {
+    pixels.setPixelColor(PIXEL, pixels.Color(0, i, 0));
+    pixels.show();
+    delay(5);
+  }
+  pixels.clear();
+}
+
+void clear_wake_up() {
+  state_wake_up_pin = 0;
+  digitalWrite(WAKE_UP_PIN,state_wake_up_pin);
+}
+
+void set_wake_up() {
+  state_wake_up_pin = 1;
+  digitalWrite(WAKE_UP_PIN,state_wake_up_pin);
 }
 
 
@@ -63,10 +106,11 @@ void init_ap() {
 
 char status_plugged_in = 0;
 char status_charging = 0;
-char status_car_off = 0;
+char status_car_off = 1;
 char status_lb_failsafe = 0;
 float status_soc = 0;
 float status_soh = 0;
+int battery_type = LEAF_ZE0;
 
 char timer_enabled = 0;
 String timer_start = "23:00";
@@ -83,8 +127,8 @@ unsigned long last_group_request_millis = 0;
 void loop() {
 
   CAN_frame_t rx_frame;  
-
   unsigned long currentMillis = millis();
+
 
   // Receive next CAN frame from queue
   if (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 3 * portTICK_PERIOD_MS) == pdTRUE) {
@@ -92,19 +136,27 @@ void loop() {
     if (rx_frame.FIR.B.RTR != CAN_RTR) {
       timestamp_last_can_received = timestamp_now();
 
+      if (rx_frame.MsgID == 0x1c2) {  
+        battery_type = LEAF_ZE1;
+      }
+
+      if (rx_frame.MsgID == 0x59e) { 
+        battery_type = LEAF_AZE0;
+      }
+
       if (rx_frame.MsgID == 0x11a) { // Car status
         status_car_off = (rx_frame.data.u8[1] & 0xc0) >> 7;
-        Serial.printf("Car message: on:%d, charging:%d\n",status_car_off);       
+        //Serial.printf("Car message: on:%d, charging:%d\n",status_car_off);       
       }
 
       if (rx_frame.MsgID == 0x1db) { // HVBAT status
         status_lb_failsafe = (rx_frame.data.u8[1] & 0x07);
-        Serial.printf("LB_Failsafe (0=OK):%d\n",status_lb_failsafe);     
+        //Serial.printf("LB_Failsafe (0=OK):%d\n",status_lb_failsafe);     
       }  
 
       if (rx_frame.MsgID == 0x5bc) { // HVBAT
           status_soh = rx_frame.data.u8[4] >> 1;
-          Serial.printf("SoH:%.2f\n",status_soh);
+          //Serial.printf("SoH:%.2f\n",status_soh);
       }
 
       if (rx_frame.MsgID == 0x5bf) { // On board charger information
@@ -118,7 +170,7 @@ void loop() {
         } else {
           status_charging = 0;
         }
-        Serial.printf("OBC message: plugged in:%d, charging:%d\n",status_plugged_in,status_charging);       
+        //Serial.printf("OBC message: plugged in:%d, charging:%d\n",status_plugged_in,status_charging);       
       }
 
       if (rx_frame.MsgID == 0x7bb) { // LBC info - groups
@@ -135,7 +187,13 @@ void loop() {
           pointer_group_message += rx_frame.FIR.B.DLC;
         }
         if (group == 1 && rx_frame.data.u8[0] == 0x25) { /* Done with group 1*/
-          status_soc = (( group_message[32 + 5] << 16) + (group_message[32 + 6] << 8) + (group_message[32 + 7])) / 10000;
+          // Leaf 24kWh
+          if (battery_type == 0) {
+            status_soc = (( group_message[32 + 5] << 16) + (group_message[32 + 6] << 8) + (group_message[32 + 7])) / 10000;
+          }
+          if ((battery_type == 1) || (battery_type == 2)) {
+            status_soc = (( group_message[32 + 7] << 16) + (group_message[40 + 1] << 8) + (group_message[40 + 2])) / 10000;
+          }
           Serial.printf("SoC:%.2f\n",status_soc);
         } else { // Request more messages 300100FFFFFFFFFF
           CAN_frame_t tx_frame;
@@ -155,16 +213,15 @@ void loop() {
         }
 
       }
-
-
-/*      Serial.printf(" from 0x%08X, DLC %d, Data ", rx_frame.MsgID,  rx_frame.FIR.B.DLC);
-      for (int i = 0; i < rx_frame.FIR.B.DLC; i++) {
-        Serial.printf("0x%02X ", rx_frame.data.u8[i]);
-      }
-      Serial.printf("\n");
-      */
     }
   }
+
+  /*
+  - Timer not active and charging: wake up if needed - stop charging - sleep
+  - Timer active and plugged in and not charging and soc<limit: wake up if needed - start charging
+  - Timer active and charging: check soc<limit: stop - sleep
+  */
+
   // Interval tasks
   if (currentMillis - previousMillis >= interval_can) {
     previousMillis = currentMillis;
@@ -213,7 +270,7 @@ void send_can_command(String command) {
   }
   while (counter < 25) {
     ESP32Can.CANWriteFrame(&tx_frame);
-    delay(100);
+    delay(interval_can);
     counter++;
   }
 }
@@ -240,7 +297,59 @@ int timestamp_now() {
     return tv.tv_sec;
 }
 
-void wake_up_vcm() {
+String time_now() {
+  time_t now;
+  char strftime_buf[64];
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  return String(timeinfo.tm_hour) + ":" + String(timeinfo.tm_min);
+}
+
+int get_hour(String time) {
+  char* temp_char = new char[255];
+  std::copy(time.begin(),time.end()+1,temp_char);
+  std::string temp_string = temp_char;
+  std::string hour = temp_string.substr(0, temp_string.find(":"));
+  std::copy(hour.begin(),hour.end()+1,temp_char);
+  return string2int(temp_char);
+}
+
+int get_minute(String time) {
+  char* temp_char = new char[255];
+  std::copy(time.begin(),time.end()+1,temp_char);
+  std::string temp_string = temp_char;
+  std::string minute = temp_string.substr(temp_string.find(":") + 1,-1 );
+  std::copy(minute.begin(),minute.end()+1,temp_char);
+  return string2int(temp_char);
+}
+
+
+bool timer_is_active() {
+  bool ret = false;
+  String clock_now = time_now();
+  int hour_now = get_hour(time_now());
+  int minute_now = get_minute(time_now());
+  int hour_timer_start = get_hour(timer_start);
+  int minute_timer_start = get_minute(timer_start);
+  int hour_timer_stop = get_hour(timer_stop);
+  int minute_timer_stop = get_minute(timer_stop);
+
+  int minutes = hour_now * 60 + minute_now;
+  int minutes_start = hour_timer_start * 60 + minute_timer_start;
+  int minutes_stop = hour_timer_stop * 60 + minute_timer_stop;
+
+  if (minutes_start > minutes_stop) { // passing midnight
+    if (((minutes > minutes_start) && (minutes < 24*60)) || (minutes < minutes_stop)) {
+      ret = true;
+    }
+  } else {
+    if ((minutes > minutes_start) && (minutes < minutes_stop)) {
+      ret = true;
+    }
+  }
+  //Serial.printf("m,m1,m2:%d,%d,%d\n",minutes,minutes_start,minutes_stop);     
+  return ret;
 
 }
 
@@ -287,10 +396,19 @@ void init_webserver() {
 
   server.on("/wake_up", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (can_data_is_old(timestamp_last_can_received)) {
+      set_wake_up();
       request->send(200, "text/plain", "Tried to wake up VCM in car!");
     } else {
-      wake_up_vcm();
       request->send(200, "text/plain", "No need to wake up VCM in car, can data is recent!");
+    }
+  });
+
+  server.on("/sleep", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (state_wake_up_pin == 1) {
+      clear_wake_up();
+      request->send(200, "text/plain", "VCM wake-up pin has now been cleared.");
+    } else {
+      request->send(200, "text/plain", "VCM wake-up pin is already zero!");
     }
   });
 
@@ -393,7 +511,11 @@ String processor(const String& var)
   if(var == "TIMER") {
     String content = "";
     if (timer_enabled) {
-      content += "Timer enabled: " + String(timer_start) + " - " + String(timer_stop) + ", charge to SoC: " + String(timer_soc) + "&#37;";
+      if (timer_is_active()) {
+        content += "Timer is now active: " + String(timer_start) + " - " + String(timer_stop) + ", charge to SoC: " + String(timer_soc) + "&#37;";
+      } else {
+        content += "Timer will be active: " + String(timer_start) + " - " + String(timer_stop) + ", charge to SoC: " + String(timer_soc) + "&#37;";
+      }
     } else {
       content += "Timer is disabled";
     }
@@ -418,6 +540,18 @@ String processor(const String& var)
     content += "HV Status: " + String(status) + "<br>";
     return content;
   }
+
+  if(var == "BATTERY_TYPE") {
+    String content = "";
+    String status = "";
+    if (battery_type == 0) { status = "ZE0"; }
+    if (battery_type == 1) { status = "AZE0"; }
+    if (battery_type == 2) { status = "ZE1"; }
+    content += "Battery type: " + String(status) + "<br>";
+    return content;
+  }
+
+
   if(var == "TIMER_ENABLED_0") {
     String content = "";
     if (timer_enabled == 0) { content = "selected"; }
