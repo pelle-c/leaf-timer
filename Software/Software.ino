@@ -115,6 +115,7 @@ int battery_type = LEAF_ZE0;
 char timer_enabled = 0;
 String timer_start = "23:00";
 String timer_stop = "05:00";
+String html_message = "";
 int timer_soc = 80;
 
 int timestamp_last_can_received = 0;
@@ -256,6 +257,16 @@ void send_can_command(String command) {
     tx_frame.FIR.B.DLC = 1;
     tx_frame.data.u8[0] = 0x66;
   }
+  if (command == "start_acc") {
+    tx_frame.MsgID = 0x56e;
+    tx_frame.FIR.B.DLC = 1;
+    tx_frame.data.u8[0] = 0x4e;
+  }
+  if (command == "stop_acc") {
+    tx_frame.MsgID = 0x56e;
+    tx_frame.FIR.B.DLC = 1;
+    tx_frame.data.u8[0] = 0x56;
+  }
   if (command == "stop_charging") { // 000200100000e3df
     tx_frame.MsgID = 0x1db;
     tx_frame.FIR.B.DLC = 8;
@@ -381,35 +392,52 @@ void init_webserver() {
   });
 
   server.on("/control", HTTP_GET, [](AsyncWebServerRequest* request) {
+    html_message = "";
     request->send_P(200, "text/html", control_html, processor);
   });
 
   server.on("/start_charging", HTTP_GET, [](AsyncWebServerRequest* request) {
     send_can_command("start_charging");
-    request->send(200, "text/plain", "Start charging can messages sent!");
+    html_message = "Start charging can messages sent!";
+    request->send_P(200, "text/html", control_html, processor);
   });
 
   server.on("/stop_charging", HTTP_GET, [](AsyncWebServerRequest* request) {
     send_can_command("stop_charging");
-    request->send(200, "text/plain", "Stop charging can messages sent!");
+    html_message = "Stop charging can messages sent!";
+    request->send_P(200, "text/html", control_html, processor);
+  });
+
+  server.on("/start_acc", HTTP_GET, [](AsyncWebServerRequest* request) {
+    send_can_command("start_acc");
+    html_message = "Start ACC can messages sent!";
+    request->send_P(200, "text/html", control_html, processor);
+  });
+
+  server.on("/stop_acc", HTTP_GET, [](AsyncWebServerRequest* request) {
+    send_can_command("stop_acc");
+    html_message = "Stop ACC can messages sent!";
+    request->send_P(200, "text/html", control_html, processor);
   });
 
   server.on("/wake_up", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (can_data_is_old(timestamp_last_can_received)) {
       set_wake_up();
-      request->send(200, "text/plain", "Tried to wake up VCM in car!");
+      html_message = "Tried to wake up VCM in car!";
     } else {
-      request->send(200, "text/plain", "No need to wake up VCM in car, can data is recent!");
+      html_message = "No need to wake up VCM in car, can data is recent!";
     }
+    request->send_P(200, "text/html", control_html, processor);
   });
 
   server.on("/sleep", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (state_wake_up_pin == 1) {
       clear_wake_up();
-      request->send(200, "text/plain", "VCM wake-up pin has now been cleared.");
+      html_message = "VCM wake-up pin has now been cleared.";
     } else {
-      request->send(200, "text/plain", "VCM wake-up pin is already zero!");
+      html_message = "VCM wake-up pin is already zero!";
     }
+    request->send_P(200, "text/html", control_html, processor);
   });
 
   server.on("/timer_set", HTTP_GET, [](AsyncWebServerRequest* request) {
@@ -419,9 +447,10 @@ void init_webserver() {
       timer_stop = request->getParam("timer_stop")->value();
       timer_soc = string2int(request->getParam("timer_soc")->value());
     } else {
-      request->send(200, "text/plain", "No params found in request");
+      html_message = "No params found in request";
     }
-    request->send(200, "text/plain", "Timer set!");
+    html_message = "Timer set!";
+    request->send_P(200, "text/html", message_html, processor);
   });
 
   server.on("/clock_set", HTTP_GET, [](AsyncWebServerRequest* request) {
@@ -432,9 +461,10 @@ void init_webserver() {
       tv_temp.tv_usec = 0; 
       settimeofday(&tv_temp, NULL);
     } else {
-      request->send(200, "text/plain", "No timestamp found in request");
+      html_message = "No timestamp found in request";
     }
-    request->send(200, "text/plain", "Clock set!");
+    html_message = "Clock set!";
+    request->send_P(200, "text/html", message_html, processor);
   });
 
   server.onNotFound(notFound);
@@ -445,7 +475,7 @@ void init_webserver() {
 String processor(const String& var)
 {
   if(var == "LINKS") {
-    String content = "<a href='/' class='button'>Overview</a>&nbsp;<a href='/timer' class='button'>Set timer</a>&nbsp;<a href='/clock' class='button'>Set clock</a>&nbsp;<a href='/control' class='button'>Control</a><br><hr>";
+    String content = "<a href='/' class='button'>Overview</a>&nbsp;<a href='/timer' class='button'>Set timer</a>&nbsp;<a href='/clock' class='button'>Set clock</a>&nbsp;<a href='/control' class='button'>Manual Control</a><br><hr>";
     return content;
   }
 
@@ -570,6 +600,19 @@ String processor(const String& var)
     String content = "";
     if (timer_enabled == 1) { content = "selected"; }
     return content;
+  } 
+  if(var == "DIV_MESSAGE_CLASS") {
+    String content = "";
+    if (html_message == "") {
+      content = "hidden";      
+    } else {
+      content = "border";      
+    }
+    return content;
+  } 
+
+  if(var == "MESSAGE") {
+    return html_message;
   } 
 
 
