@@ -70,15 +70,55 @@ a.button {
     background-color: buttonface;
     text-decoration: none;
 }</style>
+<script type="text/javascript">
+function dateToUnixEpoch(date) {
+        return Math.floor(date.getTime()) / 1000;
+}
+function getTime(param) {
+  var time_now = (new Date().toLocaleTimeString()).substring(0,5);
+  var date_now = (new Date().toISOString()).substring(0,10);
+  var epoch = dateToUnixEpoch(new Date());
+ console.log(time_now);
+ console.log(epoch);
+  if (param == "clock") {
+    return time_now;
+  }
+  if (param == "date") {
+    return date_now;
+  }
+}
+function set_timestamp() {
+  const zeroPad = (num, places) => String(num).padStart(places, '0')
+  var tz_offset = new Date().getTimezoneOffset();
+  var h_offset = parseInt(tz_offset / 60);
+  var sign = "-";
+  if (h_offset < 0) {
+    sign = "+";
+    h_offset = -h_offset;
+  }
+  var m_offset = Math.abs(tz_offset) - (Math.abs(h_offset) * 60);
+  var datetime_value = document.getElementById("date").value + "T" + document.getElementById("clock").value + ":00" + sign + zeroPad(h_offset,2) + ":" + zeroPad(m_offset,2);
+  const ms = parseInt(dateToUnixEpoch(new Date(datetime_value)));
+  console.log(datetime_value);
+  console.log(ms);
+  document.getElementById("timestamp").setAttribute('value',ms);
+  return true;
+}
+</script>
 <body>
 <h1>Leaf timer - Set clock</h1>
 %LINKS%<br>
 <form action='/clock_set'>
-Epoch timestamp now: <input type='number' id='timestamp' name='timestamp' ><br>
-Clock:<input type='time' id='clock' name='clock' value='12:00'><br><br>
-Date:<input type='date' id='date' name='date' value=''><br><br>
-<br><input type="submit" value="Set clock" />
-</form></body>
+<input type="hidden" id="timestamp" name="timestamp" value="">
+Clock:<input type='time' id='clock' name='clock'><br><br>
+Date:<input type='date' id='date' name='date'><br><br>
+<script type="text/javascript">
+  document.getElementById("clock").setAttribute('value',getTime('clock'));
+  document.getElementById("date").setAttribute('value',getTime('date'));
+</script>
+<br><input type="submit" value="Set clock" onclick="return set_timestamp();" />
+</form>
+</body>
 )rawliteral";
 
 const char control_html[] = R"rawliteral(
