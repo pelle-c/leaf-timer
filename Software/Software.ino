@@ -591,6 +591,10 @@ void init_webserver() {
     request->send_P(200, "text/html", index_html, processor);
   });
 
+  server.on("/div_overview", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", div_overview_html, processor);
+  });
+
   server.on("/timer", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send_P(200, "text/html", timer_html, processor);
   });

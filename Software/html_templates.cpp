@@ -1,9 +1,41 @@
 const char index_html[] = R"rawliteral(
 <!doctypehtml><title>Leaf Timer</title>
 <script type="text/javascript">
+function xmlhttpGet(strURL) {
+    var xmlHttpReq = false;
+    var self = this;
+    // Mozilla/Safari
+    if (window.XMLHttpRequest) {
+        self.xmlHttpReq = new XMLHttpRequest();
+    }
+    // IE
+    else if (window.ActiveXObject) {
+        self.xmlHttpReq = new ActiveXObject("Microsoft.XMLHTTP");
+    }
+
+    self.xmlHttpReq.overrideMimeType('Content-Type', 'text/html');
+    self.xmlHttpReq.open('GET', strURL, true);
+    self.xmlHttpReq.send();
+
+    self.xmlHttpReq.onreadystatechange = function() {
+        if (self.xmlHttpReq.readyState == 4) {
+            update_div(self.xmlHttpReq.responseText);
+        }
+    }
+}
+function update_div(str){
+  document.getElementById("div_overview").innerHTML=str;
+}
+
+function doLoop1()
+{
+  xmlhttpGet('div_overview');
+  setTimeout(doLoop1,1000);
+}
+
 function load()
 {
-setTimeout("window.open('/', '_self');", 5000);
+  doLoop1();
 }
 </script>
 <meta content="width=device-width"name=viewport><style>html{font-family:Arial;display:inline-block;text-align:center}h2{font-size:3rem}body{max-width:800px;margin:0 auto}
@@ -18,6 +50,13 @@ a.button {
 <body onload="load()">
 <h1>Leaf timer</h1>
 %LINKS%<br>
+<div id="div_overview">
+</div>
+</body>
+)rawliteral";
+
+
+const char div_overview_html[] = R"rawliteral(
 %CLOCK%
 %CAN_DATA%
 %TIMER%<br>
@@ -30,8 +69,8 @@ a.button {
 %HV_STATUS%<br>
 %BATTERY_TYPE%
 </div>
-</body>
 )rawliteral";
+
 
 const char timer_html[] = R"rawliteral(
 <!doctypehtml><title>Leaf Timer</title>
