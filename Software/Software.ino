@@ -74,7 +74,7 @@ char log_buffer[LOG_BUFFER_SIZE];
 int pointer_log_buffer = 0;
 int log_semaphore = 0;
 u_char old_can_1db[16];
-
+int retry_stop_charge_counter = 0;
 
 void setup() {
   init_time();
@@ -329,7 +329,8 @@ vars:
   When charging: check soc all the time
   Not charging, plugged in: check soc every 15 min 
   Handle: wake up, when not plugged in - set retry timer!
-  TODO: fake situations below, fix reboot
+  TODO: test situations below
+  TODO: "Stop charging" will send multiple can messages, emulating a battery full message from the LBC. After this, the VCM has to go to sleep before starting to charge again.
 */
 
   // Interval tasks
@@ -341,8 +342,9 @@ vars:
     counter_bat++;
 
     if (counter_check_timer > interval_check_timer) { // check timer data
-      logger("Checking timer");
+      Serial.println("Checking timer");     
       if (vcm_is_sleeping()) {
+        retry_stop_charge_counter = 0;
         if ((timer_is_active()) && (timestamp_now() > retry_wake_up_at)) {
           bool changed = set_wake_up();
           if (changed) {
@@ -356,18 +358,42 @@ vars:
         }
       } else { // can bus is active
         if ((!timer_is_active()) && (is_charging)) {
-          send_can_command("stop_charging");
+          if (retry_stop_charge_counter < 5) {
+            if (retry_stop_charge_counter == 0) { logger("Timer is not active, trying to stop."); }
+            send_can_command("stop_charging");
+            clear_wake_up();
+            retry_wake_up_at = timestamp_now() + 900; // The VCM needs to be asleep a while before charging can be turned on again
+            retry_stop_charge_counter++;
+          } else {
+            if (retry_stop_charge_counter < 6) {
+              logger("Failed to stop charging when timer is not active, giving up now.");
+              retry_stop_charge_counter++;
+            }
+          }
         }
         if ((!timer_is_active()) && (!is_charging)) {
+          retry_stop_charge_counter = 0;
           clear_wake_up();
         }
         if ((timer_is_active()) && (!is_charging) && (status_soc<(timer_soc - soc_hysteresis)) && (is_plugged_in)) {
+          logger("Timer is active and soc is lower than wanted, let's start to charge.");
           send_can_command("start_charging");
           soc_hysteresis = 0;
         }
         if ((timer_is_active()) && (is_charging) && (status_soc>timer_soc) ) {
-          send_can_command("stop_charging");
           soc_hysteresis = 2;
+          Serial.println(String(retry_stop_charge_counter));
+          if (retry_stop_charge_counter < 5) {
+            if (retry_stop_charge_counter == 0) { logger("Wanted SoC has been reached, trying to stop."); }
+            send_can_command("stop_charging");
+            clear_wake_up();
+            retry_stop_charge_counter++;
+          } else {
+            if (retry_stop_charge_counter < 6) {
+              logger("Failed to stop charging when wanted SoC has been reached, giving up now.");
+              retry_stop_charge_counter++;
+            }
+          }
         }
         if ((timer_is_active()) && (!is_plugged_in)) {
           logger("Can't start to charge - not plugged in or vcm is sleeping. Let's sleep and check later.");
@@ -379,7 +405,7 @@ vars:
       counter_check_timer = 0;
     }
 
-    if ((!vcm_is_sleeping()) && (counter_bat > interval_bat)) { // Request battery information
+    if ((timer_is_active()) && (!vcm_is_sleeping()) && (counter_bat > interval_bat)) { // Request battery information
       pointer_group_message = 0; // Reset the pointer (group request timeout)
       group = 0;
       counter_bat = 0;
@@ -509,8 +535,10 @@ int get_minute(String time) {
 
 bool timer_is_active() {
   bool ret = false;
+  if (timer_enabled == 0) {
+    return false;
+  }
   String clock_now = time_now();
-  // Serial.println(clock_now);     
   int hour_now = get_hour(time_now());
   int minute_now = get_minute(time_now());
   int hour_timer_start = get_hour(timer_start);
