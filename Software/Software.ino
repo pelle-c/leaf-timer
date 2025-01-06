@@ -10,6 +10,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <cstring>
 #include "html_templates.cpp"
+#include "SETTINGS.h"
 
 #define CONFIG_ASYNC_TCP_MAX_ACK_TIME=5000   // (keep default)
 #define CONFIG_ASYNC_TCP_PRIORITY=10         // (keep default)
@@ -18,8 +19,8 @@
 #define CONFIG_ASYNC_TCP_STACK_SIZE=4096     // reduce the stack size (default is 16K)
 
 
-const char *ssid = "lily";
-const char *password = "0123456789";
+const char *ssid = AP_SSID;
+const char *password = AP_PASSWORD;
 
 AsyncWebServer server(80);
 
