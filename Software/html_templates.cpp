@@ -21,6 +21,7 @@ a.button {
 %CLOCK%
 %CAN_DATA%
 %TIMER%<br>
+%WAKE_UP%<br>
 <div id="status" %DIV_STATUS_STYLE%>
 %SOC%<br>
 %SOH%<br>

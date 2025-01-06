@@ -790,7 +790,6 @@ String processor(const String& var)
     content += "HV Status: " + String(status) + "<br>";
     return content;
   }
-
   if(var == "BATTERY_TYPE") {
     String content = "";
     String status = "";
@@ -800,11 +799,14 @@ String processor(const String& var)
     content += "Battery type: " + String(status) + "<br>";
     return content;
   }
-
-
   if(var == "TIMER_ENABLED_0") {
     String content = "";
     if (timer_enabled == 0) { content = "selected"; }
+    return content;
+  } 
+  if(var == "WAKE_UP") {
+    String content = "";
+    content += "Wake up bit: " + String(state_wake_up_pin) + "<br>";
     return content;
   } 
   if(var == "TIMER_START") {
