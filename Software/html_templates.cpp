@@ -181,3 +181,23 @@ a.button {
 %MESSAGE%
 </body>
 )rawliteral";
+
+const char log_html[] = R"rawliteral(
+<!doctypehtml><title>Leaf Timer</title>
+<meta content="width=device-width"name=viewport><style>html{font-family:Arial;display:inline-block;text-align:center}h2{font-size:3rem}body{max-width:800px;margin:0 auto}
+a.button {
+    padding: 1px 6px;
+    border: 1px outset buttonborder;
+    border-radius: 3px;
+    color: buttontext;
+    background-color: buttonface;
+    text-decoration: none;
+}</style>
+<body>
+<h1>Leaf timer - Log</h1>
+%LINKS%<br>
+<div id="log" align="left">
+%LOG%
+</div>
+</body>
+)rawliteral";
