@@ -11,6 +11,8 @@
 #include <cstring>
 #include "html_templates.cpp"
 #include "SETTINGS.h"
+#include "Preferences.h"
+
 
 #define CONFIG_ASYNC_TCP_MAX_ACK_TIME=5000   // (keep default)
 #define CONFIG_ASYNC_TCP_PRIORITY=10         // (keep default)
@@ -77,7 +79,9 @@ int log_semaphore = 0;
 u_char old_can_1db[16];
 int retry_stop_charge_counter = 0;
 
+
 void setup() {
+  read_preferences();
   init_time();
   Serial.begin(115200);
   Serial.println();
@@ -91,6 +95,40 @@ void setup() {
   digitalWrite(WAKE_UP_PIN,state_wake_up_pin);
   blink_led();
 }
+
+
+void read_preferences() {
+  Preferences preferences;
+  char temp_string[10];
+
+  preferences.begin("leaf-timer", true);
+  timer_enabled = preferences.getUInt("timer_enabled", 0);
+  timer_soc = preferences.getUInt("timer_soc", 0);
+  size_t l_string = preferences.getString("timer_start", temp_string, sizeof(temp_string));
+  if (l_string > 0) {  // Successfully read the string from memory. Set it to SSID!
+    timer_start = temp_string;
+  } else {
+    timer_start = "23:15";
+  }
+  l_string = preferences.getString("timer_stop", temp_string, sizeof(temp_string));
+  if (l_string > 0) {  // Successfully read the string from memory. Set it to SSID!
+    timer_stop = temp_string;
+  } else {
+    timer_stop = "05:15";
+  }
+  preferences.end();
+}
+
+void write_preferences() {
+  Preferences preferences;
+  preferences.begin("leaf-timer", false);
+  preferences.putUInt("timer_enabled", timer_enabled);
+  preferences.putUInt("timer_soc", timer_soc);
+  preferences.putString("timer_start", String(timer_start.c_str()));
+  preferences.putString("timer_stop", String(timer_stop.c_str()));
+  preferences.end();
+}
+
 
 void blink_led() {
   pixels.begin();
@@ -318,16 +356,18 @@ void loop() {
 
   check_can_bus();
 
-  int led_intensity = (int) (led_counter/10);
-  if (vcm_is_sleeping()) {
-    pixels.setPixelColor(PIXEL, pixels.Color(led_intensity, 0, 0));
-  } else {
-    pixels.setPixelColor(PIXEL, pixels.Color(0, led_intensity, 0));
-  }
-  pixels.show();
+  if (USE_LED_FOR_STATUS == 1) {
+    int led_intensity = (int) (led_counter/10);
+    if (vcm_is_sleeping()) {
+      pixels.setPixelColor(PIXEL, pixels.Color(led_intensity, 0, 0));
+    } else {
+      pixels.setPixelColor(PIXEL, pixels.Color(0, led_intensity, 0));
+    }
+    pixels.show();
 
-  led_counter++;
-  if (led_counter > 500) { led_counter = 0;}
+    led_counter++;
+    if (led_counter > 500) { led_counter = 0;}
+  }
 
 /*
 State:
@@ -692,12 +732,13 @@ void init_webserver() {
       timer_start = request->getParam("timer_start")->value();
       timer_stop = request->getParam("timer_stop")->value();
       timer_soc = string2int(request->getParam("timer_soc")->value());
+      html_message = "Timer set!";
+      write_preferences();
+      logger("Timer set");
     } else {
       html_message = "No params found in request";
     }
-    html_message = "Timer set!";
     request->send_P(200, "text/html", message_html, processor);
-    logger("Timer set");
   });
 
   server.on("/clock_set", HTTP_GET, [](AsyncWebServerRequest* request) {
