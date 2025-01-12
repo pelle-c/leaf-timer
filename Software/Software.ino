@@ -62,7 +62,7 @@ String html_message = "";
 int timer_soc = 80;
 int soc_hysteresis = 0;
 
-long timestamp_last_can_received = -600;
+long timestamp_last_can_received = -600;  // Timestamp when can message with soc was rec
 long last_wake_up_timestamp = 0;
 long retry_wake_up_at = 0;
 u_char group_message[255];
@@ -122,6 +122,7 @@ bool set_wake_up() {
     logger("Setting wake-up bit");
     state_wake_up_pin = 1;
     digitalWrite(WAKE_UP_PIN,state_wake_up_pin);
+    last_wake_up_timestamp = timestamp_now();
     return true;
   } 
   return false;
@@ -225,7 +226,6 @@ void check_can_bus() {
   if (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 3 * portTICK_PERIOD_MS) == pdTRUE) {
 
     if (rx_frame.FIR.B.RTR != CAN_RTR) {
-      timestamp_last_can_received = timestamp_now();
       if (rx_frame.MsgID == 0x1c2) {  
         battery_type = LEAF_ZE1;
       }
@@ -243,6 +243,14 @@ void check_can_bus() {
         status_lb_failsafe = (rx_frame.data.u8[1] & 0x07);
         //Serial.printf("LB_Failsafe (0=OK):%d\n",status_lb_failsafe);     
       }  
+      if (rx_frame.MsgID == 0x55b) { // HVBAT, soc etc
+        int LB_TEMP = (rx_frame.data.u8[0] << 2 | rx_frame.data.u8[1] >> 6);
+        if (LB_TEMP != 0x3ff) {  //3FF is unavailable value
+          timestamp_last_can_received = timestamp_now();
+          status_soc = 0.1 * LB_TEMP;
+        }
+        Serial.printf("SoC:%.2f\n",status_soc);
+      }
       if (rx_frame.MsgID == 0x5bc) { // HVBAT
           status_soh = rx_frame.data.u8[4] >> 1;
           //Serial.printf("SoH:%.2f\n",status_soh);
@@ -303,10 +311,23 @@ void check_can_bus() {
   }
 }
 
+int led_counter = 0;
 
 void loop() {
 
+
   check_can_bus();
+
+  int led_intensity = (int) (led_counter/10);
+  if (vcm_is_sleeping()) {
+    pixels.setPixelColor(PIXEL, pixels.Color(led_intensity, 0, 0));
+  } else {
+    pixels.setPixelColor(PIXEL, pixels.Color(0, led_intensity, 0));
+  }
+  pixels.show();
+
+  led_counter++;
+  if (led_counter > 500) { led_counter = 0;}
 
 /*
 State:
@@ -344,68 +365,68 @@ vars:
 
     if (counter_check_timer > interval_check_timer) { // check timer data
       Serial.println("Checking timer");     
-      if (vcm_is_sleeping()) {
-        retry_stop_charge_counter = 0;
-        if ((timer_is_active()) && (timestamp_now() > retry_wake_up_at)) {
-          bool changed = set_wake_up();
-          if (changed) {
-            last_wake_up_timestamp = timestamp_now();
-          }
-        }
-        if ((timer_is_active()) && (timestamp_now() > last_wake_up_timestamp + 60) && (timestamp_now() > retry_wake_up_at)) { // No can messages, but should be awake
-          logger("VCM should be awake, but I'm not getting anything. Let's sleep and check later.");
-          clear_wake_up();
-          retry_wake_up_at = timestamp_now() + 600;
-        }
-      } else { // can bus is active
-        if ((!timer_is_active()) && (is_charging)) {
-          if (retry_stop_charge_counter < 5) {
-            if (retry_stop_charge_counter == 0) { logger("Timer is not active, trying to stop."); }
-            send_can_command("stop_charging");
-            clear_wake_up();
-            retry_wake_up_at = timestamp_now() + 900; // The VCM needs to be asleep a while before charging can be turned on again
-            retry_stop_charge_counter++;
-          } else {
-            if (retry_stop_charge_counter < 6) {
-              logger("Failed to stop charging when timer is not active, giving up now.");
-              retry_stop_charge_counter++;
-            }
-          }
-        }
-        if ((!timer_is_active()) && (!is_charging)) {
+      if (timer_is_enabled()) {
+        if (vcm_is_sleeping()) {
           retry_stop_charge_counter = 0;
-          clear_wake_up();
-        }
-        if ((timer_is_active()) && (!is_charging) && (status_soc<(timer_soc - soc_hysteresis)) && (is_plugged_in)) {
-          logger("Timer is active and soc is lower than wanted, let's start to charge.");
-          send_can_command("start_charging");
-          soc_hysteresis = 0;
-        }
-        if ((timer_is_active()) && (is_charging) && (status_soc>timer_soc) ) {
-          soc_hysteresis = 2;
-          Serial.println(String(retry_stop_charge_counter));
-          if (retry_stop_charge_counter < 5) {
-            if (retry_stop_charge_counter == 0) { logger("Wanted SoC has been reached, trying to stop."); }
-            send_can_command("stop_charging");
+          if ((timer_is_active()) && (timestamp_now() > retry_wake_up_at)) {
+            bool changed = set_wake_up();
+          }
+          if ((timer_is_active()) && (timestamp_now() > last_wake_up_timestamp + 60) && (timestamp_now() > retry_wake_up_at)) { // No can messages, but should be awake
+            logger("VCM should be awake, but I'm not getting anything. Let's sleep and check later.");
             clear_wake_up();
-            retry_stop_charge_counter++;
-          } else {
-            if (retry_stop_charge_counter < 6) {
-              logger("Failed to stop charging when wanted SoC has been reached, giving up now.");
+            retry_wake_up_at = timestamp_now() + 600;
+          }
+        } else { // can bus is active
+          bool changed = set_wake_up(); // Keep wake_up bit set
+          if ((!timer_is_active()) && (is_charging)) {
+            if (retry_stop_charge_counter < 5) {
+              if (retry_stop_charge_counter == 0) { logger("Timer is not active, trying to stop."); }
+              send_can_command("stop_charging");
+              clear_wake_up();
+              retry_wake_up_at = timestamp_now() + 900; // The VCM needs to be asleep a while before charging can be turned on again
               retry_stop_charge_counter++;
+            } else {
+              if (retry_stop_charge_counter < 6) {
+                logger("Failed to stop charging when timer is not active, giving up now.");
+                retry_stop_charge_counter++;
+              }
             }
           }
-        }
-        if ((timer_is_active()) && (!is_plugged_in)) {
-          logger("Can't start to charge - not plugged in or vcm is sleeping. Let's sleep and check later.");
-          clear_wake_up();
-          retry_wake_up_at = timestamp_now() + 600;
+          if ((!timer_is_active()) && (!is_charging)) {
+            retry_stop_charge_counter = 0;
+            clear_wake_up();
+          }
+          if ((timer_is_active()) && (!is_charging) && (status_soc<(timer_soc - soc_hysteresis)) && (is_plugged_in)) {
+            logger("Timer is active and soc is lower than wanted, let's start to charge.");
+            send_can_command("start_charging");
+            soc_hysteresis = 0;
+          }
+          if ((timer_is_active()) && (is_charging) && (status_soc>timer_soc) ) {
+            soc_hysteresis = 2;
+            Serial.println(String(retry_stop_charge_counter));
+            if (retry_stop_charge_counter < 5) {
+              if (retry_stop_charge_counter == 0) { logger("Wanted SoC has been reached, trying to stop."); }
+              send_can_command("stop_charging");
+              clear_wake_up();
+              retry_stop_charge_counter++;
+            } else {
+              if (retry_stop_charge_counter < 6) {
+                logger("Failed to stop charging when wanted SoC has been reached, giving up now.");
+                retry_stop_charge_counter++;
+              }
+            }
+          }
+          if ((timer_is_active()) && (!is_plugged_in)) {
+            logger("Can't start to charge - not plugged in or vcm is sleeping. Let's sleep and check later.");
+            clear_wake_up();
+            retry_wake_up_at = timestamp_now() + 600;
+          }
         }
       }
-
       counter_check_timer = 0;
     }
 
+    /*
     if ((timer_is_active()) && (!vcm_is_sleeping()) && (counter_bat > interval_bat)) { // Request battery information
       pointer_group_message = 0; // Reset the pointer (group request timeout)
       group = 0;
@@ -424,6 +445,7 @@ vars:
       tx_frame.data.u8[7] = 0x00;
       ESP32Can.CANWriteFrame(&tx_frame);
     }
+    */
   }
 }
 
@@ -449,9 +471,17 @@ void send_can_command(String command) {
     tx_frame.data.u8[0] = 0x56;
   }
   if (command == "stop_charging") { // 000200100000e3df
-    unsigned char new1db[8];
     tx_frame.MsgID = 0x1db;
     tx_frame.FIR.B.DLC = 8;
+    tx_frame.data.u8[0] = 0x00;
+    tx_frame.data.u8[1] = 0x02;
+    tx_frame.data.u8[2] = 0x00;
+    tx_frame.data.u8[3] = 0x10;
+    tx_frame.data.u8[4] = 0x00;
+    tx_frame.data.u8[5] = 0x00;
+    tx_frame.data.u8[6] = 0xe3;
+    tx_frame.data.u8[7] = 0xdf;    /*
+    unsigned char new1db[8];
     for (int i = 0; i < tx_frame.FIR.B.DLC; i++) {
       new1db[i] = old_can_1db[i];
     }
@@ -461,6 +491,7 @@ void send_can_command(String command) {
     for (int i = 0; i < tx_frame.FIR.B.DLC; i++) {
       tx_frame.data.u8[i] = new1db[i];
     }
+    */
     interval_frame = 1;
     num_frames_to_send = 10;
   }
@@ -476,14 +507,13 @@ void send_can_command(String command) {
 
 
 bool vcm_is_sleeping() {
-  int ts_now = timestamp_now();
-  if (ts_now > (timestamp_last_can_received + 10)) {
+  if ((seconds_since_can_data(timestamp_last_can_received) > 10) or (timestamp_last_can_received == 0)) {
     return true;
   }
   return false;
 }
 
-int seconds_since_can_data(int last_timestamp) {
+int seconds_since_can_data(long last_timestamp) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (tv.tv_sec - last_timestamp);
@@ -533,12 +563,16 @@ int get_minute(String time) {
   return string2int(temp_char2);
 }
 
-
-bool timer_is_active() {
-  bool ret = false;
+bool timer_is_enabled() {
   if (timer_enabled == 0) {
     return false;
   }
+  return true;
+}
+
+
+bool timer_is_active() {
+  bool ret = false;
   String clock_now = time_now();
   int hour_now = get_hour(time_now());
   int minute_now = get_minute(time_now());
@@ -561,7 +595,6 @@ bool timer_is_active() {
     }
   }
   return ret;
-
 }
 
 int string2int(String temp_string) {
@@ -634,11 +667,11 @@ void init_webserver() {
   });
 
   server.on("/wake_up", HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (vcm_is_sleeping()) {
-      bool changed = set_wake_up();
+    bool changed = set_wake_up();
+    if (changed) {
       html_message = "Tried to wake up VCM in car!";
     } else {
-      html_message = "No need to wake up VCM in car, can data is recent!";
+      html_message = "No need to wake up VCM in car, bit already set!";
     }
     request->send_P(200, "text/html", control_html, processor);
   });
@@ -753,19 +786,20 @@ String processor(const String& var)
   if(var == "CAN_DATA") {
     String content = "";
     String font_p = "<p style='color:MediumSeaGreen;'>";
-    if ((seconds_since_can_data(timestamp_last_can_received) > 60) or (timestamp_last_can_received == 0)) {
+//    if ((seconds_since_can_data(timestamp_last_can_received) > 60) or (timestamp_last_can_received == 0)) {
+    if (vcm_is_sleeping()) {
       font_p = "<p style='color:red;'>";
     }
     if (timestamp_last_can_received <= 0) {
       content += String(font_p) + "No can messages seen yet</p>";
     } else {
-      content += String(font_p) + "Last can message seen: " + String(seconds_since_can_data(timestamp_last_can_received)) + "s ago</p>";
+      content += String(font_p) + "Last can message with SoC seen: " + String(seconds_since_can_data(timestamp_last_can_received)) + "s ago</p>";
     }
     return content;
   } 
   if(var == "TIMER") {
     String content = "";
-    if (timer_enabled == 1) {
+    if (timer_is_enabled()) {
       if (timer_is_active()) {
         content += "Timer is now active: " + String(timer_start) + " - " + String(timer_stop) + ", charge to SoC: " + String(timer_soc) + "&#37;";
       } else {
