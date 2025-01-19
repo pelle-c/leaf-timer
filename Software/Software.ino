@@ -29,7 +29,7 @@ AsyncWebServer server(80);
 CAN_device_t CAN_cfg;               // CAN Config
 unsigned long previousMillis = 0;   // will store last time a CAN Message was send
 const int interval_base = 100;       // at which interval to send CAN Messages (milliseconds)
-const int interval_bat = 50;        // n * interval_base at which interval to send CAN Messages to battery for detailed info
+const int interval_bat = 100;        // n * interval_base at which interval to send CAN Messages to battery for detailed info
 const int rx_queue_size = 10;       // Receive Queue size
 const int interval_check_timer = 10;// n * interval_base at which interval to check the timer
 
@@ -48,15 +48,19 @@ Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 #define LOG_BUFFER_SIZE 8192
 
 int state_wake_up_pin = 0;
-
+int charge_complete = 0;
 char is_plugged_in = 0;
 char is_charging = 0;
-char status_car_off = 1;
+int status_car = 0;
 char status_lb_failsafe = 0;
 float status_soc = 0;
+float hq_status_soc = 0;
 float status_soh = 0;
 int battery_type = LEAF_ZE0;
-
+float hv_voltage = 0;
+float hv_current = 0;
+float hq_hv_voltage = 0;
+float hq_hv_current = 0;
 int timer_enabled = 0;
 String timer_start = "23:00";
 String timer_stop = "05:00";
@@ -64,7 +68,8 @@ String html_message = "";
 int timer_soc = 80;
 int soc_hysteresis = 0;
 
-long timestamp_last_can_received = -600;  // Timestamp when can message with soc was rec
+long timestamp_last_soc_received = -600;  // Timestamp when can message with soc was rec
+long timestamp_last_11a_received = -600;  // Timestamp when can message with 1db was rec
 long last_wake_up_timestamp = 0;
 long retry_wake_up_at = 0;
 u_char group_message[255];
@@ -78,7 +83,9 @@ int pointer_log_buffer = 0;
 int log_semaphore = 0;
 u_char old_can_1db[16];
 int retry_stop_charge_counter = 0;
-
+int previous_loop_timer_active = 0;
+int should_send_stop_charge = 0;
+int should_send_charge_complete = 0;
 
 void setup() {
   read_preferences();
@@ -180,17 +187,76 @@ void init_can() {
   CAN_cfg.rx_pin_id = GPIO_NUM_26;
   CAN_cfg.rx_queue = xQueueCreate(rx_queue_size, sizeof(CAN_frame_t));
   ESP32Can.CANInit();
+  logger("Initialized can bus");
   // = [0x00,0x02,0x00,0x10,0x00,0x00,0xe3,0xdf];
   old_can_1db[0] = 0x00;
-  old_can_1db[1] = 0x02;
-  old_can_1db[2] = 0x00;
-  old_can_1db[3] = 0x10;
+  old_can_1db[1] = 0x00;
+  old_can_1db[2] = 0xc0;
+  old_can_1db[3] = 0xea;
   old_can_1db[4] = 0x00;
   old_can_1db[5] = 0x00;
-  old_can_1db[6] = 0xe3;
-  old_can_1db[7] = 0xdf;
-  logger("Initialized can bus");
+  old_can_1db[6] = 0x02;
+  old_can_1db[7] = 0x00;
 }
+
+void send_can_stop_charge() {
+  // We use the frame that the LBC just sent, and modify a few bits (like ovms does).
+  // But, instead of spamming. We send eight frames (1ms interval) right after a 1db frame
+  // has been received. By sending eight, the next message from the LBC will have a correct
+  // prune counter. The interval for the LBC for 1db frames is 10ms, so we will fit those eight
+  // before next one is sent.
+  CAN_frame_t tx_frame;
+  unsigned char new1db[8];
+
+  logger("Sending stop_charge frames");
+  tx_frame.FIR.B.FF = CAN_frame_std;
+  tx_frame.MsgID = 0x1db;
+  tx_frame.FIR.B.DLC = 8;
+  for (int j = 0; j < 8; j++) {  
+    for (int i = 0; i < tx_frame.FIR.B.DLC; i++) {
+      new1db[i] = old_can_1db[i];
+    }
+    new1db[1] = (new1db[1] & 0xe0) | 2; // LB_Relay_Cut_Request
+    new1db[3] = new1db[3] | 0x10; // LB_Full_CHARGE_flag
+    new1db[6] = (new1db[6] + 1) % 4; // Increment LB_PRUN_1DB counter
+    new1db[7] = leafcrc(7, new1db); //  CRC
+    for (int i = 0; i < tx_frame.FIR.B.DLC; i++) {
+      tx_frame.data.u8[i] = new1db[i];
+      old_can_1db[i] = new1db[i];
+    }
+    ESP32Can.CANWriteFrame(&tx_frame);
+    delay(1);
+  }
+  should_send_stop_charge = 0;
+}
+
+void send_can_charge_complete() {
+  // Get back to normal
+  CAN_frame_t tx_frame;
+  unsigned char new1db[8];
+  logger("Remove relay_cut request and full_charge flag");
+  tx_frame.FIR.B.FF = CAN_frame_std;
+  tx_frame.MsgID = 0x1db;
+  tx_frame.FIR.B.DLC = 8;
+  for (int j = 0; j < 8; j++) {  
+    for (int i = 0; i < tx_frame.FIR.B.DLC; i++) {
+      new1db[i] = old_can_1db[i];
+    }
+    new1db[1] = (new1db[1] & 0xe7); // Remove LB_Relay_Cut_Request
+    new1db[3] = new1db[3] & 0xEF; // LB_Full_CHARGE_flag
+    new1db[6] = (new1db[6] + 1) % 4; // Increment LB_PRUN_1DB counter
+    new1db[7] = leafcrc(7, new1db); //  CRC
+    for (int i = 0; i < tx_frame.FIR.B.DLC; i++) {
+      tx_frame.data.u8[i] = new1db[i];
+      old_can_1db[i] = new1db[i];
+    }
+    ESP32Can.CANWriteFrame(&tx_frame);
+    delay(1);
+  }
+  should_send_charge_complete = 0;
+}
+
+
 
 void init_ap() {
   if (!WiFi.softAP(ssid, password)) {
@@ -202,18 +268,27 @@ void init_ap() {
   Serial.println(myIP);
 }
 
+
+#define SEC_PER_DAY   86400
+#define SEC_PER_HOUR  3600
+#define SEC_PER_MIN   60
+
 void logger(String s) {
   Serial.println(s);
   while (log_semaphore == 1) {
     delay(1);
   }
+  time_t now = time(NULL);
+  struct tm *tm_struct = localtime(&now);
+  int hour = tm_struct->tm_hour;
+  int min = tm_struct->tm_min;
+  int sec = tm_struct->tm_sec;
+
   log_semaphore = 1;
   if (pointer_log_buffer + s.length() + 20 < LOG_BUFFER_SIZE ) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL); 
-    double ts = (1.0 * tv.tv_sec + 0.000001 * tv.tv_usec);
     char temp_char[255];
-    sprintf(temp_char,"%.3f - %s<br>",ts,s.c_str());
+    sprintf(temp_char,"%02d:%02d:%02d - %s<br>",hour,min,sec,s.c_str());
+//    sprintf(temp_char,"%.3f - %s<br>",ts,s.c_str());
     for (int i = 0; i < strlen(temp_char) + 1; i++) {
       log_buffer[i + pointer_log_buffer] = temp_char[i];
     }
@@ -271,23 +346,38 @@ void check_can_bus() {
         battery_type = LEAF_AZE0;
       }
       if (rx_frame.MsgID == 0x11a) { // Car status
-        status_car_off = (rx_frame.data.u8[1] & 0xc0) >> 7;
-        //Serial.printf("Car message: on:%d, charging:%d\n",status_car_off);       
+        // 2 = car off, 1 = car on, 0 = no data
+        status_car = (rx_frame.data.u8[1] & 0xc0) >> 6;
+        timestamp_last_11a_received = timestamp_now();        
       } 
+
       if (rx_frame.MsgID == 0x1db) { // HVBAT status
+        hv_voltage = 0.5 * (rx_frame.data.u8[2] << 2 + ((rx_frame.data.u8[3] & 0xc0) >> 6));
+
+        int hv_current_int = (rx_frame.data.u8[0] << 3 + ((rx_frame.data.u8[1] & 0xe0) >> 5));
+        if (hv_current_int & 1024) {
+          hv_current_int = - (1024 - hv_current_int);
+        }
+        hv_current = 0.5 * hv_current_int;
+
         for (int i = 0; i < rx_frame.FIR.B.DLC; i++) {
           old_can_1db[i] = rx_frame.data.u8[i];
         }
         status_lb_failsafe = (rx_frame.data.u8[1] & 0x07);
-        //Serial.printf("LB_Failsafe (0=OK):%d\n",status_lb_failsafe);     
+        if (should_send_stop_charge == 1) {
+          send_can_stop_charge();
+        }
+        if (should_send_charge_complete == 1) {
+          send_can_charge_complete();
+        }
       }  
+
       if (rx_frame.MsgID == 0x55b) { // HVBAT, soc etc
         int LB_TEMP = (rx_frame.data.u8[0] << 2 | rx_frame.data.u8[1] >> 6);
         if (LB_TEMP != 0x3ff) {  //3FF is unavailable value
-          timestamp_last_can_received = timestamp_now();
+          timestamp_last_soc_received = timestamp_now();
           status_soc = 0.1 * LB_TEMP;
         }
-        Serial.printf("SoC:%.2f\n",status_soc);
       }
       if (rx_frame.MsgID == 0x5bc) { // HVBAT
           status_soh = rx_frame.data.u8[4] >> 1;
@@ -320,29 +410,40 @@ void check_can_bus() {
           }
           pointer_group_message += rx_frame.FIR.B.DLC;
         }
-        if (group == 1 && rx_frame.data.u8[0] == 0x25) { /* Done with group 1*/
+        if (group == 1 && rx_frame.data.u8[0] == 0x25) { //Last frame
           // Leaf 24kWh
           if (battery_type == 0) {
-            status_soc = (( group_message[32 + 5] << 16) + (group_message[32 + 6] << 8) + (group_message[32 + 7])) / 10000;
+            hq_status_soc = (( group_message[32 + 5] << 16) + (group_message[32 + 6] << 8) + (group_message[32 + 7])) / 10000;
           }
           if ((battery_type == 1) || (battery_type == 2)) {
-            status_soc = (( group_message[32 + 7] << 16) + (group_message[40 + 1] << 8) + (group_message[40 + 2])) / 10000;
+            hq_status_soc = (( group_message[32 + 7] << 16) + (group_message[40 + 1] << 8) + (group_message[40 + 2])) / 10000;
           }
-          Serial.printf("SoC:%.2f\n",status_soc);
+          hq_hv_voltage = (( group_message[24 + 1] << 8) | group_message[24 + 2]) / 100;
+          long batt_i_2 = ( group_message[8 + 3] << 24) | ( group_message[8 + 4] << 16 | (( group_message[8 + 5] << 8) | group_message[8 + 6]));
+          if (batt_i_2 & 0x8000000 == 0x8000000) {
+            batt_i_2 = (batt_i_2 | -0x100000000 );
+          }
+          hq_hv_current = batt_i_2 / 1024;
+          logger("High precision soc received...");
+          Serial.printf("7bb I:%.2f\n",hq_hv_current);
+          Serial.printf("7bb U:%.2f\n",hq_hv_voltage);
+          Serial.printf("7bb SoC:%.2f\n",hq_status_soc);
         } else { // Request more messages 300100FFFFFFFFFF
-          CAN_frame_t tx_frame;
-          tx_frame.FIR.B.FF = CAN_frame_std;
-          tx_frame.MsgID = 0x79b;
-          tx_frame.FIR.B.DLC = 8;
-          tx_frame.data.u8[0] = 0x30;
-          tx_frame.data.u8[1] = 0x01;
-          tx_frame.data.u8[2] = 0x00;
-          tx_frame.data.u8[3] = 0xff;
-          tx_frame.data.u8[4] = 0xff;
-          tx_frame.data.u8[5] = 0xff;
-          tx_frame.data.u8[6] = 0xff;
-          tx_frame.data.u8[7] = 0xff;
-          ESP32Can.CANWriteFrame(&tx_frame);
+          if (GET_HIGH_PRECISION_INFO_FROM_BATTERY) {
+            CAN_frame_t tx_frame;
+            tx_frame.FIR.B.FF = CAN_frame_std;
+            tx_frame.MsgID = 0x79b;
+            tx_frame.FIR.B.DLC = 8;
+            tx_frame.data.u8[0] = 0x30;
+            tx_frame.data.u8[1] = 0x01;
+            tx_frame.data.u8[2] = 0x00;
+            tx_frame.data.u8[3] = 0xff;
+            tx_frame.data.u8[4] = 0xff;
+            tx_frame.data.u8[5] = 0xff;
+            tx_frame.data.u8[6] = 0xff;
+            tx_frame.data.u8[7] = 0xff;
+            ESP32Can.CANWriteFrame(&tx_frame);
+          }
         }
       }
     }
@@ -353,8 +454,18 @@ int led_counter = 0;
 
 void loop() {
 
-
   check_can_bus();
+
+  if (timestamp_last_11a_received - timestamp_now() > 30) {
+    status_car = 0;
+  }
+
+  if (vcm_is_sleeping()) {
+    hq_hv_current = 0;
+    hq_hv_voltage = 0;
+    hq_status_soc = 0;
+    is_charging = 0;
+  }
 
   if (USE_LED_FOR_STATUS == 1) {
     int led_intensity = (int) (led_counter/10);
@@ -369,32 +480,6 @@ void loop() {
     if (led_counter > 500) { led_counter = 0;}
   }
 
-/*
-State:
-No can messages -> sleeping
-can-messages - car-on/car-off, plugged in/not
-
-No can, no timer => do nothing
-No can, timer => wake up...retry_at
-
-Can, no timer, not charging => do nothing
-Can, no timer, charging => stop charging
-can, timer, not charging, plugged in => check soc-start charge
-can, timer, charging, plugged_in => check soc-stop charge
-
-vars:
-- timer_is_active
-- is_charging
-- is_plugged_in
-- vcm_is_sleeping (no can messages)
-
-  When charging: check soc all the time
-  Not charging, plugged in: check soc every 15 min 
-  Handle: wake up, when not plugged in - set retry timer!
-  TODO: test situations below
-  TODO: "Stop charging" will send multiple can messages, emulating a battery full message from the LBC. After this, the VCM has to go to sleep before starting to charge again.
-*/
-
   // Interval tasks
   unsigned long currentMillis = millis();
 
@@ -403,91 +488,135 @@ vars:
     counter_check_timer++;  
     counter_bat++;
 
-    if (counter_check_timer > interval_check_timer) { // check timer data
-      Serial.println("Checking timer");     
-      if (timer_is_enabled()) {
-        if (vcm_is_sleeping()) {
-          retry_stop_charge_counter = 0;
-          if ((timer_is_active()) && (timestamp_now() > retry_wake_up_at)) {
-            bool changed = set_wake_up();
-          }
-          if ((timer_is_active()) && (timestamp_now() > last_wake_up_timestamp + 60) && (timestamp_now() > retry_wake_up_at)) { // No can messages, but should be awake
-            logger("VCM should be awake, but I'm not getting anything. Let's sleep and check later.");
-            clear_wake_up();
-            retry_wake_up_at = timestamp_now() + 600;
-          }
-        } else { // can bus is active
-          bool changed = set_wake_up(); // Keep wake_up bit set
-          if ((!timer_is_active()) && (is_charging)) {
-            if (retry_stop_charge_counter < 5) {
-              if (retry_stop_charge_counter == 0) { logger("Timer is not active, trying to stop."); }
-              send_can_command("stop_charging");
-              clear_wake_up();
-              retry_wake_up_at = timestamp_now() + 900; // The VCM needs to be asleep a while before charging can be turned on again
-              retry_stop_charge_counter++;
-            } else {
-              if (retry_stop_charge_counter < 6) {
-                logger("Failed to stop charging when timer is not active, giving up now.");
-                retry_stop_charge_counter++;
-              }
-            }
-          }
-          if ((!timer_is_active()) && (!is_charging)) {
-            retry_stop_charge_counter = 0;
-            clear_wake_up();
-          }
-          if ((timer_is_active()) && (!is_charging) && (status_soc<(timer_soc - soc_hysteresis)) && (is_plugged_in)) {
-            logger("Timer is active and soc is lower than wanted, let's start to charge.");
-            send_can_command("start_charging");
-            soc_hysteresis = 0;
-          }
-          if ((timer_is_active()) && (is_charging) && (status_soc>timer_soc) ) {
-            soc_hysteresis = 2;
-            Serial.println(String(retry_stop_charge_counter));
-            if (retry_stop_charge_counter < 5) {
-              if (retry_stop_charge_counter == 0) { logger("Wanted SoC has been reached, trying to stop."); }
-              send_can_command("stop_charging");
-              clear_wake_up();
-              retry_stop_charge_counter++;
-            } else {
-              if (retry_stop_charge_counter < 6) {
-                logger("Failed to stop charging when wanted SoC has been reached, giving up now.");
-                retry_stop_charge_counter++;
-              }
-            }
-          }
-          if ((timer_is_active()) && (!is_plugged_in)) {
-            logger("Can't start to charge - not plugged in or vcm is sleeping. Let's sleep and check later.");
-            clear_wake_up();
-            retry_wake_up_at = timestamp_now() + 600;
-          }
+    // Send idle can message when vcm is awake - fool car that we still have a TCU
+
+    if (!vcm_is_sleeping()) {
+      if (!is_charging) {
+        if (status_car == 1) {
+          send_can_command("idle_car_on"); // 0x46 is sent from TCU when car is on
         }
+        if (status_car == 2) {
+          send_can_command("idle"); // 0x86 is sent from TCU when car is off
+        } 
       }
-      counter_check_timer = 0;
     }
 
-    /*
-    if ((timer_is_active()) && (!vcm_is_sleeping()) && (counter_bat > interval_bat)) { // Request battery information
-      pointer_group_message = 0; // Reset the pointer (group request timeout)
-      group = 0;
-      counter_bat = 0;
-      CAN_frame_t tx_frame;
-      tx_frame.FIR.B.FF = CAN_frame_std;
-      tx_frame.MsgID = 0x79b;
-      tx_frame.FIR.B.DLC = 8;
-      tx_frame.data.u8[0] = 0x02;
-      tx_frame.data.u8[1] = 0x21;
-      tx_frame.data.u8[2] = 0x01;
-      tx_frame.data.u8[3] = 0x00;
-      tx_frame.data.u8[4] = 0x00;
-      tx_frame.data.u8[5] = 0x00;
-      tx_frame.data.u8[6] = 0x00;
-      tx_frame.data.u8[7] = 0x00;
-      ESP32Can.CANWriteFrame(&tx_frame);
+    if (timer_is_enabled()) {
+      // check timer data
+      if (counter_check_timer > interval_check_timer) { 
+        Serial.println("Checking timer");     
+        if (!timer_is_active()) {
+          clear_wake_up();
+          previous_loop_timer_active = 0;
+        }
+
+        // If timer has changed from inactive to active, wake up the vcm (maybe we missed plugged in state etc)
+        if ( (timer_is_active()) && (previous_loop_timer_active == 0) && (vcm_is_sleeping()) ) {
+          logger("Timer went to active state, VCM is asleep - wake up...");
+          bool changed = set_wake_up();
+          previous_loop_timer_active = 1;
+        }
+
+        // Since the car will always try to charge when we plug in, we will probably know if it's plugged in or not. And a fairly updated SoC.
+        if ((timer_is_active()) && (status_soc<(timer_soc - soc_hysteresis)) && (is_plugged_in)) { // Only wake up when timer is enabled and soc is low
+          if (vcm_is_sleeping()) {
+            retry_stop_charge_counter = 0;
+            if ((timestamp_now() > retry_wake_up_at)) {
+              logger("Timer is active, VCM is asleep");
+              bool changed = set_wake_up();
+            }
+            if ((timestamp_now() > last_wake_up_timestamp + 60) && (timestamp_now() > retry_wake_up_at)) { // No can messages, but should be awake
+              logger("VCM should be awake, but I'm not getting anything.");
+              clear_wake_up();
+              retry_wake_up_at = timestamp_now() + 600;
+            }
+          } else { // can bus is active, soc is low
+            if ((!is_charging) && (status_soc<(timer_soc - soc_hysteresis)) ) {
+              logger("Timer is active and soc is lower than wanted, let's start to charge.");
+              send_can_command("start_charging");
+              charge_complete = 0;
+              soc_hysteresis = 0;
+            }
+          } 
+        } 
+
+
+//int charge_complete = 0;
+//    if (status_lb_failsafe & 2) { status = "Charge disabled"; }
+
+
+
+        if ((timer_is_active()) && (is_charging) && (status_soc>timer_soc) ) {
+          charge_complete = 1;
+          soc_hysteresis = 2;
+          Serial.println(String(retry_stop_charge_counter));
+          if (retry_stop_charge_counter < 100) {
+            if (retry_stop_charge_counter == 0) { logger("Wanted SoC has been reached, trying to stop."); }
+            send_can_command("stop_charging");
+            retry_stop_charge_counter++;
+          } else {
+            if (retry_stop_charge_counter < 101) {
+              logger("Failed to stop charging when wanted SoC has been reached, giving up now.");
+              retry_stop_charge_counter++;
+            }
+          }
+        }
+
+        if ((timer_is_active()) && (!is_charging) && (status_soc>timer_soc) ) {
+          logger("Charge complete, soc has been reached and no longer charging.");
+          clear_wake_up();
+        }
+
+        if ((!timer_is_active()) && (is_charging)) {
+          charge_complete = 1;
+          if (retry_stop_charge_counter < 100) {
+            if (retry_stop_charge_counter == 0) { logger("Timer is not active, trying to stop charging."); }
+            send_can_command("stop_charging");
+            retry_wake_up_at = timestamp_now() + 900; // The VCM needs to be asleep a while before charging can be turned on again
+            retry_stop_charge_counter++;
+          } else {
+            if (retry_stop_charge_counter < 101) {
+              logger("Failed to stop charging when timer is not active, giving up now.");
+              clear_wake_up();
+              retry_stop_charge_counter++;
+            }
+          }
+        }
+        // Stopped and disabled charging, let's go back to normal
+        if ( (charge_complete == 1) && (!is_charging) && ((status_lb_failsafe & 2)) ) {
+          charge_complete = 2;
+          logger("No longer charging, go back to normal");
+          send_can_command("charge_complete");
+        }
+        counter_check_timer = 0;
+      }
     }
-    */
+
+    // When charging, request battery details
+    if (GET_HIGH_PRECISION_INFO_FROM_BATTERY) {
+      if ((is_charging) && (!vcm_is_sleeping()) && (counter_bat > interval_bat)) { 
+        pointer_group_message = 0; // Reset the pointer (group request timeout)
+        group = 0;
+        counter_bat = 0;
+        CAN_frame_t tx_frame;
+        tx_frame.FIR.B.FF = CAN_frame_std;
+        tx_frame.MsgID = 0x79b;
+        tx_frame.FIR.B.DLC = 8;
+        tx_frame.data.u8[0] = 0x02;
+        tx_frame.data.u8[1] = 0x21;
+        tx_frame.data.u8[2] = 0x01;
+        tx_frame.data.u8[3] = 0x00;
+        tx_frame.data.u8[4] = 0x00;
+        tx_frame.data.u8[5] = 0x00;
+        tx_frame.data.u8[6] = 0x00;
+        tx_frame.data.u8[7] = 0x00;
+        Serial.println("Sending 79b");     
+        ESP32Can.CANWriteFrame(&tx_frame);
+      }
+    }
   }
 }
+
 
 void send_can_command(String command) {
   CAN_frame_t tx_frame;
@@ -495,10 +624,51 @@ void send_can_command(String command) {
   int num_frames_to_send = 25;
   int interval_frame = 100;
 
+  if (command == "charge_complete") { 
+    logger("Will send can messages for:" + command + " when next 1db frame arrives");
+    should_send_charge_complete = 1; // wait for LBC to send a 1db message, then immediately send x frames
+    return;
+    /*
+    tx_frame.MsgID = 0x1db;
+    tx_frame.FIR.B.DLC = 8;
+    tx_frame.data.u8[0] = 0x00;
+    tx_frame.data.u8[1] = 0x02;
+    tx_frame.data.u8[2] = 0x00;
+    tx_frame.data.u8[3] = 0x10;
+    tx_frame.data.u8[4] = 0x00;
+    tx_frame.data.u8[5] = 0x00;
+    tx_frame.data.u8[6] = 0xe3;
+    tx_frame.data.u8[7] = 0xdf;   
+    interval_frame = 1;
+    num_frames_to_send = 10;
+    */
+  }
+
+
+
   if (command == "start_charging") {
+    logger("Sending can messages for:" + command);
     tx_frame.MsgID = 0x56e;
     tx_frame.FIR.B.DLC = 1;
     tx_frame.data.u8[0] = 0x66;
+  }
+  if (command == "idle_car_on") {
+    num_frames_to_send = 1;
+    tx_frame.MsgID = 0x56e;
+    tx_frame.FIR.B.DLC = 1;
+    tx_frame.data.u8[0] = 0x46;
+  }
+  if (command == "idle") {
+    num_frames_to_send = 1;
+    tx_frame.MsgID = 0x56e;
+    tx_frame.FIR.B.DLC = 1;
+    tx_frame.data.u8[0] = 0x86;
+  }
+  if (command == "status") {
+    num_frames_to_send = 1;
+    tx_frame.MsgID = 0x56e;
+    tx_frame.FIR.B.DLC = 1;
+    tx_frame.data.u8[0] = 0x46;
   }
   if (command == "start_acc") {
     tx_frame.MsgID = 0x56e;
@@ -511,6 +681,10 @@ void send_can_command(String command) {
     tx_frame.data.u8[0] = 0x56;
   }
   if (command == "stop_charging") { // 000200100000e3df
+    logger("Will send can messages for:" + command + " when next 1db frame arrives");
+    should_send_stop_charge = 1; // wait for LBC to send a 1db message, then immediately send x frames
+    return;
+    /*
     tx_frame.MsgID = 0x1db;
     tx_frame.FIR.B.DLC = 8;
     tx_frame.data.u8[0] = 0x00;
@@ -520,23 +694,12 @@ void send_can_command(String command) {
     tx_frame.data.u8[4] = 0x00;
     tx_frame.data.u8[5] = 0x00;
     tx_frame.data.u8[6] = 0xe3;
-    tx_frame.data.u8[7] = 0xdf;    /*
-    unsigned char new1db[8];
-    for (int i = 0; i < tx_frame.FIR.B.DLC; i++) {
-      new1db[i] = old_can_1db[i];
-    }
-    new1db[1] = (new1db[1] & 0xe0) | 2; // Charging Mode Stop Request
-    new1db[6] = (new1db[6] + 1) % 4; // Increment PRUN counter
-    new1db[7] = leafcrc(7, new1db); // Sign message with correct CRC
-    for (int i = 0; i < tx_frame.FIR.B.DLC; i++) {
-      tx_frame.data.u8[i] = new1db[i];
-    }
-    */
+    tx_frame.data.u8[7] = 0xdf;   
     interval_frame = 1;
     num_frames_to_send = 10;
+    */
   }
  
-  logger("Sending can messages for:" + command);
   int counter = 0;
   while (counter < num_frames_to_send) {
     ESP32Can.CANWriteFrame(&tx_frame);
@@ -547,7 +710,7 @@ void send_can_command(String command) {
 
 
 bool vcm_is_sleeping() {
-  if ((seconds_since_can_data(timestamp_last_can_received) > 10) or (timestamp_last_can_received == 0)) {
+  if ((seconds_since_can_data(timestamp_last_soc_received) > 30) or (timestamp_last_soc_received == 0)) {
     return true;
   }
   return false;
@@ -612,6 +775,9 @@ bool timer_is_enabled() {
 
 
 bool timer_is_active() {
+  if (timer_is_enabled() == 0) {
+    return false;
+  }
   bool ret = false;
   String clock_now = time_now();
   int hour_now = get_hour(time_now());
@@ -626,11 +792,11 @@ bool timer_is_active() {
   int minutes_stop = hour_timer_stop * 60 + minute_timer_stop;
 
   if (minutes_start > minutes_stop) { // passing midnight
-    if (((minutes > minutes_start) && (minutes < 24*60)) || (minutes < minutes_stop)) {
+    if (((minutes >= minutes_start) && (minutes < 24*60)) || (minutes < minutes_stop)) {
       ret = true;
     }
   } else {
-    if ((minutes > minutes_start) && (minutes < minutes_stop)) {
+    if ((minutes >= minutes_start) && (minutes < minutes_stop)) {
       ret = true;
     }
   }
@@ -683,8 +849,12 @@ void init_webserver() {
   });
 
   server.on("/start_charging", HTTP_GET, [](AsyncWebServerRequest* request) {
-    send_can_command("start_charging");
-    html_message = "Start charging can messages sent!";
+    if (!timer_is_enabled()) {
+      send_can_command("start_charging");
+      html_message = "Start charging can messages sent!";
+    } else {
+      html_message = "Refuse to start when timer is enabled!";
+    }
     request->send_P(200, "text/html", control_html, processor);
   });
 
@@ -707,21 +877,30 @@ void init_webserver() {
   });
 
   server.on("/wake_up", HTTP_GET, [](AsyncWebServerRequest* request) {
-    bool changed = set_wake_up();
-    if (changed) {
-      html_message = "Tried to wake up VCM in car!";
+    if (!timer_is_enabled()) {
+      bool changed = set_wake_up();
+      if (changed) {
+        html_message = "Tried to wake up VCM in car!";
+      } else {
+        html_message = "No need to wake up VCM in car, bit already set!";
+      }
+
     } else {
-      html_message = "No need to wake up VCM in car, bit already set!";
+      html_message = "Refuse to start when timer is enabled!";
     }
     request->send_P(200, "text/html", control_html, processor);
   });
 
   server.on("/sleep", HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (state_wake_up_pin == 1) {
-      clear_wake_up();
-      html_message = "VCM wake-up pin has now been cleared.";
+    if (!timer_is_enabled()) {
+      if (state_wake_up_pin == 1) {
+        clear_wake_up();
+        html_message = "VCM wake-up pin has now been cleared.";
+      } else {
+        html_message = "VCM wake-up pin is already zero!";
+      }
     } else {
-      html_message = "VCM wake-up pin is already zero!";
+      html_message = "Refuse to start when timer is enabled!";
     }
     request->send_P(200, "text/html", control_html, processor);
   });
@@ -780,7 +959,7 @@ String processor(const String& var)
 
   if(var == "DIV_STATUS_STYLE") {
     String content = "";
-    if (timestamp_last_can_received <= 0) {
+    if (timestamp_last_soc_received <= 0) {
       content = "style='display: none;'";
     }
     return content;
@@ -800,20 +979,16 @@ String processor(const String& var)
   } 
   if(var == "SOC") {
     String content = "";
-    content += "SoC: " + String(status_soc) + "&#37;<br>";
+    float soc = status_soc;
+    if (hq_status_soc > 0) {
+      soc = hq_status_soc;
+    }
+    content += "SoC: " + String(soc) + "&#37;<br>";
     return content;
   } 
   if(var == "SOH") {
     String content = "";
     content += "SoH: " + String(status_soh) + "&#37;<br>";
-    return content;
-  } 
-  if(var == "CAR_OFF") {
-    String content = "";
-    String status = "";
-    if (status_car_off == 0) { status = "On"; }
-    if (status_car_off == 1) { status = "Off"; }
-    content += "Car: " + String(status) + "<br>";
     return content;
   } 
   if(var == "PLUGGED_IN") {
@@ -824,17 +999,27 @@ String processor(const String& var)
     content += "Plugged in: " + String(status) + "<br>";
     return content;
   } 
+
+  if(var == "CAR_STATUS") {
+    String content = "";
+    String status = "";
+    if (status_car == 2) { status = "off"; }
+    if (status_car == 1) { status = "on"; }
+    if (status_car == 0) { status = "idle"; }
+    content += "Car is: " + String(status) + "<br>";
+    return content;
+  } 
+
   if(var == "CAN_DATA") {
     String content = "";
     String font_p = "<p style='color:MediumSeaGreen;'>";
-//    if ((seconds_since_can_data(timestamp_last_can_received) > 60) or (timestamp_last_can_received == 0)) {
     if (vcm_is_sleeping()) {
       font_p = "<p style='color:red;'>";
     }
-    if (timestamp_last_can_received <= 0) {
+    if (timestamp_last_soc_received <= 0) {
       content += String(font_p) + "No can messages seen yet</p>";
     } else {
-      content += String(font_p) + "Last can message with SoC seen: " + String(seconds_since_can_data(timestamp_last_can_received)) + "s ago</p>";
+      content += String(font_p) + "Last can message with SoC seen: " + String(seconds_since_can_data(timestamp_last_soc_received)) + "s ago</p>";
     }
     return content;
   } 
@@ -860,6 +1045,7 @@ String processor(const String& var)
     content += "Charging: " + String(status) + "<br>";
     return content;
   } 
+
   if(var == "HV_STATUS") {
     String content = "";
     String status = "";
@@ -870,6 +1056,22 @@ String processor(const String& var)
     content += "HV Status: " + String(status) + "<br>";
     return content;
   }
+
+  if(var == "HV_POWER") {
+    String content = "";
+    String status = "";
+    if (status_car == 2) { status = "off"; }
+    if (status_car == 1) { status = "on"; }
+    if (status_car == 0) { status = "idle"; }
+    float power = hv_voltage * hv_current;
+    if (hq_hv_voltage > 0) {
+      power = hq_hv_voltage * hq_hv_current;
+    }
+    power = std::trunc(power / 10) / 100.0;
+    content += "HV Power: " + String(power) + "kW<br>";
+    return content;
+  } 
+
   if(var == "BATTERY_TYPE") {
     String content = "";
     String status = "";

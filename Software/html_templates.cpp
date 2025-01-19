@@ -66,7 +66,9 @@ const char div_overview_html[] = R"rawliteral(
 %SOH%<br>
 %PLUGGED_IN%<br>
 %CHARGING%<br>
+%CAR_STATUS%<br>
 %HV_STATUS%<br>
+%HV_POWER%<br>
 %BATTERY_TYPE%
 </div>
 )rawliteral";
