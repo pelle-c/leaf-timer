@@ -12,6 +12,7 @@
 #include "html_templates.cpp"
 #include "SETTINGS.h"
 #include "Preferences.h"
+#include "src/sdcard.h"
 
 
 #define CONFIG_ASYNC_TCP_MAX_ACK_TIME=5000   // (keep default)
@@ -47,6 +48,7 @@ Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 #define LOG_BUFFER_SIZE 8192
 
+int candump = 0;
 int state_wake_up_pin = 0;
 int charge_complete = 0;
 char is_plugged_in = 0;
@@ -69,7 +71,9 @@ int timer_soc = 80;
 int soc_hysteresis = 0;
 
 long timestamp_last_soc_received = -600;  // Timestamp when can message with soc was rec
-long timestamp_last_11a_received = -600;  // Timestamp when can message with 1db was rec
+long timestamp_last_11a_received = -600;  // Timestamp when can message with 11a was rec
+long timestamp_last_1d4_received = -600;  // Timestamp when can message with 1d4 was rec
+long timestamp_car_went_on = -600;  // Timestamp when can off->on
 long last_wake_up_timestamp = 0;
 long retry_wake_up_at = 0;
 u_char group_message[255];
@@ -101,6 +105,8 @@ void setup() {
   state_wake_up_pin = 0;
   digitalWrite(WAKE_UP_PIN,state_wake_up_pin);
   blink_led();
+//  init_logging_buffer();
+  init_sdcard();
 }
 
 
@@ -154,11 +160,17 @@ void blink_led() {
   pixels.clear();
 }
 
+void show_led_wakeup_pin(int state) {
+  pixels.setPixelColor(PIXEL, pixels.Color(state*50, state*50, 0));
+  pixels.show();
+}
+
 void clear_wake_up() {
   if (state_wake_up_pin == 1) {
     logger("Clearing wake-up bit");
     state_wake_up_pin = 0;
     digitalWrite(WAKE_UP_PIN,state_wake_up_pin);
+    show_led_wakeup_pin(0);
   }
 }
 
@@ -168,6 +180,15 @@ bool set_wake_up() {
     state_wake_up_pin = 1;
     digitalWrite(WAKE_UP_PIN,state_wake_up_pin);
     last_wake_up_timestamp = timestamp_now();
+    show_led_wakeup_pin(1);
+    // wake up using can...
+    CAN_frame_t tx_frame;
+    tx_frame.FIR.B.FF = CAN_frame_std;
+    tx_frame.MsgID = 0x679;
+    tx_frame.FIR.B.DLC = 1;
+    tx_frame.data.u8[0] = 0x00;
+    send_can_frame(tx_frame);
+
     return true;
   } 
   return false;
@@ -224,7 +245,7 @@ void send_can_stop_charge() {
       tx_frame.data.u8[i] = new1db[i];
       old_can_1db[i] = new1db[i];
     }
-    ESP32Can.CANWriteFrame(&tx_frame);
+    send_can_frame(tx_frame);
     delay(1);
   }
   should_send_stop_charge = 0;
@@ -250,7 +271,7 @@ void send_can_charge_complete() {
       tx_frame.data.u8[i] = new1db[i];
       old_can_1db[i] = new1db[i];
     }
-    ESP32Can.CANWriteFrame(&tx_frame);
+    send_can_frame(tx_frame);
     delay(1);
   }
   should_send_charge_complete = 0;
@@ -337,8 +358,8 @@ void check_can_bus() {
   CAN_frame_t rx_frame;  
   // Receive next CAN frame from queue
   if (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 3 * portTICK_PERIOD_MS) == pdTRUE) {
-
     if (rx_frame.FIR.B.RTR != CAN_RTR) {
+      log2sd(rx_frame,RX_FRANE);
       if (rx_frame.MsgID == 0x1c2) {  
         battery_type = LEAF_ZE1;
       }
@@ -347,18 +368,27 @@ void check_can_bus() {
       }
       if (rx_frame.MsgID == 0x11a) { // Car status
         // 2 = car off, 1 = car on, 0 = no data
+        int old_status_car = status_car;
         status_car = (rx_frame.data.u8[1] & 0xc0) >> 6;
+        // Emulate TCU when car turns on
+        if ( ((old_status_car == 2) || (old_status_car == 0)) && (status_car == 1)) {
+          timestamp_car_went_on = timestamp_now(); 
+        }
         timestamp_last_11a_received = timestamp_now();        
+      } 
+      if (rx_frame.MsgID == 0x1d4) { // VCM sending
+        timestamp_last_1d4_received = timestamp_now();        
       } 
 
       if (rx_frame.MsgID == 0x1db) { // HVBAT status
-        hv_voltage = 0.5 * (rx_frame.data.u8[2] << 2 + ((rx_frame.data.u8[3] & 0xc0) >> 6));
+        hv_voltage = 0.5 * (rx_frame.data.u8[2] * 4 + ((rx_frame.data.u8[3] & 0xc0) >> 6));
 
-        int hv_current_int = (rx_frame.data.u8[0] << 3 + ((rx_frame.data.u8[1] & 0xe0) >> 5));
+        int hv_current_int = (rx_frame.data.u8[0] * 8 + ((rx_frame.data.u8[1] & 0xe0) >> 5));
         if (hv_current_int & 1024) {
           hv_current_int = - (1024 - hv_current_int);
         }
         hv_current = 0.5 * hv_current_int;
+        //Serial.printf("I1:%d,%f,%f\n",hv_current_int,hv_current,hv_voltage);
 
         for (int i = 0; i < rx_frame.FIR.B.DLC; i++) {
           old_can_1db[i] = rx_frame.data.u8[i];
@@ -442,7 +472,7 @@ void check_can_bus() {
             tx_frame.data.u8[5] = 0xff;
             tx_frame.data.u8[6] = 0xff;
             tx_frame.data.u8[7] = 0xff;
-            ESP32Can.CANWriteFrame(&tx_frame);
+            send_can_frame(tx_frame);
           }
         }
       }
@@ -456,8 +486,21 @@ void loop() {
 
   check_can_bus();
 
-  if (timestamp_last_11a_received - timestamp_now() > 30) {
+  if (timestamp_last_1d4_received - timestamp_now() > 30) {
     status_car = 0;
+  }
+
+  // Car is on, wakeup pin should go low->high->low
+  if (status_car == 1) { 
+    if ((timestamp_now() - timestamp_car_went_on) < 3) {
+      clear_wake_up();
+    }
+    if ( ((timestamp_now() - timestamp_car_went_on) < 8) && ((timestamp_now() - timestamp_car_went_on) >3) ) {
+      set_wake_up();
+    }
+    if ((timestamp_now() - timestamp_car_went_on) > 8) {
+      clear_wake_up();
+    }
   }
 
   if (vcm_is_sleeping()) {
@@ -489,7 +532,6 @@ void loop() {
     counter_bat++;
 
     // Send idle can message when vcm is awake - fool car that we still have a TCU
-
     if (!vcm_is_sleeping()) {
       if (!is_charging) {
         if (status_car == 1) {
@@ -498,6 +540,8 @@ void loop() {
         if (status_car == 2) {
           send_can_command("idle"); // 0x86 is sent from TCU when car is off
         } 
+      } else {
+          send_can_command("idle");
       }
     }
 
@@ -540,12 +584,6 @@ void loop() {
           } 
         } 
 
-
-//int charge_complete = 0;
-//    if (status_lb_failsafe & 2) { status = "Charge disabled"; }
-
-
-
         if ((timer_is_active()) && (is_charging) && (status_soc>timer_soc) ) {
           charge_complete = 1;
           soc_hysteresis = 2;
@@ -563,7 +601,6 @@ void loop() {
         }
 
         if ((timer_is_active()) && (!is_charging) && (status_soc>timer_soc) ) {
-          logger("Charge complete, soc has been reached and no longer charging.");
           clear_wake_up();
         }
 
@@ -571,6 +608,7 @@ void loop() {
           charge_complete = 1;
           if (retry_stop_charge_counter < 100) {
             if (retry_stop_charge_counter == 0) { logger("Timer is not active, trying to stop charging."); }
+            set_wake_up();
             send_can_command("stop_charging");
             retry_wake_up_at = timestamp_now() + 900; // The VCM needs to be asleep a while before charging can be turned on again
             retry_stop_charge_counter++;
@@ -583,10 +621,9 @@ void loop() {
           }
         }
         // Stopped and disabled charging, let's go back to normal
-        if ( (charge_complete == 1) && (!is_charging) && ((status_lb_failsafe & 2)) ) {
+        if ( (charge_complete == 1) && (!is_charging) ) {
           charge_complete = 2;
           logger("No longer charging, go back to normal");
-          send_can_command("charge_complete");
         }
         counter_check_timer = 0;
       }
@@ -610,12 +647,18 @@ void loop() {
         tx_frame.data.u8[5] = 0x00;
         tx_frame.data.u8[6] = 0x00;
         tx_frame.data.u8[7] = 0x00;
-        Serial.println("Sending 79b");     
-        ESP32Can.CANWriteFrame(&tx_frame);
+        Serial.println("Sending 79b");
+        send_can_frame(tx_frame);     
       }
     }
   }
 }
+
+void send_can_frame(CAN_frame_t frame) {
+  ESP32Can.CANWriteFrame(&frame);
+  log2sd(frame,TX_FRAME);
+}
+
 
 
 void send_can_command(String command) {
@@ -628,20 +671,6 @@ void send_can_command(String command) {
     logger("Will send can messages for:" + command + " when next 1db frame arrives");
     should_send_charge_complete = 1; // wait for LBC to send a 1db message, then immediately send x frames
     return;
-    /*
-    tx_frame.MsgID = 0x1db;
-    tx_frame.FIR.B.DLC = 8;
-    tx_frame.data.u8[0] = 0x00;
-    tx_frame.data.u8[1] = 0x02;
-    tx_frame.data.u8[2] = 0x00;
-    tx_frame.data.u8[3] = 0x10;
-    tx_frame.data.u8[4] = 0x00;
-    tx_frame.data.u8[5] = 0x00;
-    tx_frame.data.u8[6] = 0xe3;
-    tx_frame.data.u8[7] = 0xdf;   
-    interval_frame = 1;
-    num_frames_to_send = 10;
-    */
   }
 
 
@@ -702,7 +731,7 @@ void send_can_command(String command) {
  
   int counter = 0;
   while (counter < num_frames_to_send) {
-    ESP32Can.CANWriteFrame(&tx_frame);
+    send_can_frame(tx_frame);
     delay(interval_frame);
     counter++;
   }
@@ -710,7 +739,7 @@ void send_can_command(String command) {
 
 
 bool vcm_is_sleeping() {
-  if ((seconds_since_can_data(timestamp_last_soc_received) > 30) or (timestamp_last_soc_received == 0)) {
+  if ((seconds_since_can_data(timestamp_last_1d4_received) > 30) or (timestamp_last_soc_received == 0)) {
     return true;
   }
   return false;
@@ -936,6 +965,16 @@ void init_webserver() {
   });
 
   server.on("/log", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("candump")) {
+      candump = string2long(request->getParam("candump")->value());
+      if (candump == 1) {
+        resume_can_writing();
+        logger("start candump");
+      } else {
+        pause_can_writing();
+        logger("stop candump");
+      }
+    }
     while (log_semaphore == 1) {
       delay(1);
     }
@@ -1006,6 +1045,8 @@ String processor(const String& var)
     if (status_car == 2) { status = "off"; }
     if (status_car == 1) { status = "on"; }
     if (status_car == 0) { status = "idle"; }
+    if (status_car > 2) { status = String(status_car); }
+    
     content += "Car is: " + String(status) + "<br>";
     return content;
   } 
@@ -1017,7 +1058,7 @@ String processor(const String& var)
       font_p = "<p style='color:red;'>";
     }
     if (timestamp_last_soc_received <= 0) {
-      content += String(font_p) + "No can messages seen yet</p>";
+      content += String(font_p) + "No SoC can messages seen yet</p>";
     } else {
       content += String(font_p) + "Last can message with SoC seen: " + String(seconds_since_can_data(timestamp_last_soc_received)) + "s ago</p>";
     }
@@ -1060,15 +1101,19 @@ String processor(const String& var)
   if(var == "HV_POWER") {
     String content = "";
     String status = "";
+    String precision = "~";
     if (status_car == 2) { status = "off"; }
     if (status_car == 1) { status = "on"; }
     if (status_car == 0) { status = "idle"; }
     float power = hv_voltage * hv_current;
+    //Serial.printf("I2:%f,%f,%f\n",hv_current,hv_voltage,power);
+
     if (hq_hv_voltage > 0) {
+      precision = "";
       power = hq_hv_voltage * hq_hv_current;
     }
     power = std::trunc(power / 10) / 100.0;
-    content += "HV Power: " + String(power) + "kW<br>";
+    content += "HV Power: " + precision + String(power) + "kW<br>";
     return content;
   } 
 
@@ -1111,6 +1156,27 @@ String processor(const String& var)
       content = "hidden";      
     } else {
       content = "border";      
+    }
+    return content;
+  } 
+
+
+  if(var == "SD_CARD") {
+    String content = "";
+    if (get_sdcard_status()) {
+      content = "SD Card is ok";      
+    } else {
+      content = "SD Card is not ok";      
+    }
+    return content;
+  } 
+
+  if(var == "CANDUMP") {
+    String content = "";
+    if (get_candump_status()) {
+      content = "Candump is active";      
+    } else {
+      content = "Candump is not active";      
     }
     return content;
   } 

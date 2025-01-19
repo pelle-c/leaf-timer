@@ -12,3 +12,9 @@
 // Send queries for extra information, may collide with LeafSpy.
 // Not required. Will give better readings for power.
 #define GET_HIGH_PRECISION_INFO_FROM_BATTERY 0
+
+// SD card
+#define SD_MISO_PIN 2
+#define SD_MOSI_PIN 15
+#define SD_SCLK_PIN 14
+#define SD_CS_PIN 13

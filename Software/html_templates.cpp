@@ -238,6 +238,10 @@ a.button {
 <body>
 <h1>Leaf timer - Log</h1>
 %LINKS%<br>
+<a href='/log?candump=1' class='button'>Start candump to SD</a>&nbsp<a href='log?candump=0' class='button'>Stop candump to SD</a><br><br>
+%CANDUMP%, %SD_CARD%
+<br>
+<br>
 <div id="log" align="left">
 %LOG%
 </div>
