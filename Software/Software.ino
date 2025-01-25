@@ -14,12 +14,19 @@
 #include "Preferences.h"
 #include "src/sdcard.h"
 
+int cancounter = 0;
 
 #define CONFIG_ASYNC_TCP_MAX_ACK_TIME=5000   // (keep default)
 #define CONFIG_ASYNC_TCP_PRIORITY=10         // (keep default)
 #define CONFIG_ASYNC_TCP_QUEUE_SIZE=64       // (keep default)
 #define CONFIG_ASYNC_TCP_RUNNING_CORE=1      // force async_tcp task to be on same core as Arduino app (default is any core)
 #define CONFIG_ASYNC_TCP_STACK_SIZE=4096     // reduce the stack size (default is 16K)
+
+//#define RX_FRANE 0
+//#define X_FRANE 1
+enum FRAME_DIRECTION { RX_FRAME, TX_FRAME }; 
+
+enum COMMAND_TYPE { NONE,START_CHARGING,STOP_CHARGING,STOP_CHARGING_NOW,START_ACC,STOP_ACC,WAKE_UP,IDLE_CAR_ON,IDLE }; 
 
 
 const char *ssid = AP_SSID;
@@ -28,7 +35,6 @@ const char *password = AP_PASSWORD;
 AsyncWebServer server(80);
 
 CAN_device_t CAN_cfg;               // CAN Config
-unsigned long previousMillis = 0;   // will store last time a CAN Message was send
 const int interval_base = 100;       // at which interval to send CAN Messages (milliseconds)
 const int interval_bat = 100;        // n * interval_base at which interval to send CAN Messages to battery for detailed info
 const int rx_queue_size = 10;       // Receive Queue size
@@ -46,8 +52,9 @@ Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 #define LEAF_AZE0 1
 #define LEAF_ZE1 2
 
-#define LOG_BUFFER_SIZE 8192
+#define LOG_BUFFER_SIZE 4096
 
+int command2send = 0;
 int candump = 0;
 int state_wake_up_pin = 0;
 int charge_complete = 0;
@@ -82,14 +89,41 @@ int pointer_group_message = 0;
 int counter_check_timer = 0;
 int counter_bat = 0;
 unsigned long last_group_request_millis = 0;
+
 char log_buffer[LOG_BUFFER_SIZE];
 int pointer_log_buffer = 0;
+char web_log_buffer[LOG_BUFFER_SIZE];
+int pointer_web_log_buffer = 0;
+char can_log_buffer[8192];
+int pointer_can_log_buffer = 0;
+char temp_buffer[8192];
+
+
 int log_semaphore = 0;
 u_char old_can_1db[16];
 int retry_stop_charge_counter = 0;
 int previous_loop_timer_active = 0;
 int should_send_stop_charge = 0;
-int should_send_charge_complete = 0;
+
+TaskHandle_t th_wifi_loop_task;
+#define CORE_WIFI 0
+#define TASK_WIFI_PRIO 6
+
+TaskHandle_t th_logging_loop_task;
+#define CORE_LOGGING 0
+#define TASK_LOGGING_PRIO 2
+
+TaskHandle_t th_can_rx_loop_task;
+#define CORE_MAIN 1
+#define TASK_CANRX_PRIO 4
+
+TaskHandle_t th_can_tx_loop_task;
+#define CORE_MAIN 1
+#define TASK_CANTX_PRIO 2
+
+//#define TASK_CORE_PRIO 4
+//#define TASK_MODBUS_PRIO 8
+
 
 void setup() {
   read_preferences();
@@ -98,16 +132,311 @@ void setup() {
   Serial.println();
   Serial.println("Starting Leaf timer");
   Serial.println("Configuring access point...");
-  init_ap();
-  init_can();
-  init_webserver();
   pinMode(WAKE_UP_PIN, OUTPUT);  
   state_wake_up_pin = 0;
   digitalWrite(WAKE_UP_PIN,state_wake_up_pin);
-  blink_led();
-//  init_logging_buffer();
+  init_can();
+  createCoreTasks();
   init_sdcard();
+  blink_led();
 }
+
+void createCoreTasks() {
+  xTaskCreatePinnedToCore(wifi_loop, "wifi_loop", 4096, NULL,
+                          TASK_WIFI_PRIO, &th_wifi_loop_task, CORE_WIFI);
+  xTaskCreatePinnedToCore(logging_loop, "logging_loop", 4096, NULL,
+                          TASK_LOGGING_PRIO, &th_logging_loop_task, CORE_LOGGING);
+  xTaskCreatePinnedToCore((TaskFunction_t)&can_rx_loop, "can_rx_loop", 4096, NULL,
+                          TASK_CANRX_PRIO, &th_can_rx_loop_task, CORE_MAIN);
+  xTaskCreatePinnedToCore((TaskFunction_t)&can_tx_loop, "can_tx_loop", 4096, NULL,
+                          TASK_CANTX_PRIO, &th_can_tx_loop_task, CORE_MAIN);
+}
+
+void shutdown_tasks() {
+   vTaskDelete( th_can_rx_loop_task );
+   vTaskDelete( th_can_tx_loop_task );
+   vTaskDelete( th_logging_loop_task );
+   vTaskDelete( th_wifi_loop_task );
+}
+
+
+void can_rx_loop() {
+  unsigned long previousMillis = 0; 
+
+  while (true) {
+    check_can_bus();
+
+    if (timestamp_last_11a_received - timestamp_now() > 1) {
+      status_car = 2;
+    }
+
+    if (is_charging) {
+      status_car = 0;
+    }
+
+    // Car is on, wakeup pin should go low->high->low
+    if (status_car == 1) { 
+      if ((timestamp_now() - timestamp_car_went_on) < 3) {
+        clear_wake_up();
+      }
+      if ( ((timestamp_now() - timestamp_car_went_on) < 8) && ((timestamp_now() - timestamp_car_went_on) >3) ) {
+        set_wake_up();
+      }
+      if ((timestamp_now() - timestamp_car_went_on) > 8) {
+        clear_wake_up();
+      }
+    }
+
+    // Reset status
+    if (vcm_is_sleeping()) {
+      hq_hv_current = 0;
+      hq_hv_voltage = 0;
+      hq_status_soc = 0;
+      is_charging = 0;
+    }
+
+    // Interval tasks
+    unsigned long currentMillis = millis();
+
+    if (currentMillis - previousMillis >= interval_base) {
+      previousMillis = currentMillis;
+      counter_check_timer++;  
+      counter_bat++;
+
+      // Send idle can message when vcm is awake - fool car that we still have a TCU
+      if (!vcm_is_sleeping()) {
+        if (status_car != 1) { clear_wake_up(); }
+        if (!is_charging) {
+          if (status_car == 1) {
+            send_can_command(IDLE_CAR_ON); // 0x46 is sent from TCU when car is on
+          } else {
+            send_can_command(IDLE); // 0x86 is sent from TCU when car is off
+          } 
+        } else {
+            send_can_command(IDLE);
+        }
+      }
+
+
+      // Timer is enabled, unless car is on
+      if ( (status_car != 1) && (timer_is_enabled()) ) {
+        // check timer data
+        if (counter_check_timer > interval_check_timer) { 
+          Serial.printf("Checking timer %d\n",cancounter);     
+          if (!timer_is_active()) {
+            previous_loop_timer_active = 0;
+          }
+
+          // If timer has changed from inactive to active, wake up the vcm (maybe we missed plugged in state etc)
+          if ( (timer_is_active()) && (previous_loop_timer_active == 0) && (vcm_is_sleeping()) ) {
+            logger("Timer went to active state, VCM is asleep - wake up...");
+            bool changed = set_wake_up();
+            previous_loop_timer_active = 1;
+          }
+
+          // Since the car will always try to charge when we plug in, we will probably know if it's plugged in or not. And a fairly updated SoC.
+          if ((timer_is_active()) && (status_soc<(timer_soc - soc_hysteresis)) && (is_plugged_in)) { // Only wake up when timer is enabled and soc is low
+            if (vcm_is_sleeping()) {
+              retry_stop_charge_counter = 0;
+              if ((timestamp_now() > retry_wake_up_at)) {
+                logger("Timer is active, VCM is asleep");
+                bool changed = set_wake_up();
+              }
+              if ((timestamp_now() > last_wake_up_timestamp + 60) && (timestamp_now() > retry_wake_up_at)) { // No can messages, but should be awake
+                logger("VCM should be awake, but I'm not getting anything.");
+                clear_wake_up();
+                retry_wake_up_at = timestamp_now() + 600;
+              }
+            } else { // can bus is active, soc is low
+              if ((!is_charging) && (status_soc<(timer_soc - soc_hysteresis)) ) {
+                logger("Timer is active and soc is lower than wanted, let's start to charge.");
+                send_can_command(START_CHARGING);
+                charge_complete = 0;
+                soc_hysteresis = 0;
+              }
+            } 
+          } 
+
+          if ((timer_is_active()) && (is_charging) && (status_soc>timer_soc) ) {
+            charge_complete = 1;
+            soc_hysteresis = 2;
+            Serial.println(String(retry_stop_charge_counter));
+            if (retry_stop_charge_counter < 100) {
+              if (retry_stop_charge_counter == 0) { logger("Wanted SoC has been reached, trying to stop."); }
+              send_can_command(STOP_CHARGING);
+              retry_stop_charge_counter++;
+            } else {
+              if (retry_stop_charge_counter < 101) {
+                logger("Failed to stop charging when wanted SoC has been reached, giving up now.");
+                retry_stop_charge_counter++;
+              }
+            }
+          }
+
+          if ((!timer_is_active()) && (is_charging)) {
+            charge_complete = 1;
+            if (retry_stop_charge_counter < 100) {
+              if (retry_stop_charge_counter == 0) { logger("Timer is not active, trying to stop charging."); }
+              send_can_command(STOP_CHARGING);
+              retry_wake_up_at = timestamp_now() + 900; // The VCM needs to be asleep a while before charging can be turned on again
+              retry_stop_charge_counter++;
+            } else {
+              if (retry_stop_charge_counter < 101) {
+                logger("Failed to stop charging when timer is not active, giving up now.");
+                clear_wake_up();
+                retry_stop_charge_counter++;
+              }
+            }
+          }
+          // Stopped and disabled charging, let's go back to normal
+          if ( (charge_complete == 1) && (!is_charging) ) {
+            charge_complete = 2;
+            logger("No longer charging, go back to normal");
+          }
+          counter_check_timer = 0;
+        }
+      }
+
+      // When charging, request battery details
+      if (GET_HIGH_PRECISION_INFO_FROM_BATTERY) {
+        if ((is_charging) && (!vcm_is_sleeping()) && (counter_bat > interval_bat)) { 
+          pointer_group_message = 0; // Reset the pointer (group request timeout)
+          group = 0;
+          counter_bat = 0;
+          CAN_frame_t tx_frame;
+          tx_frame.FIR.B.FF = CAN_frame_std;
+          tx_frame.MsgID = 0x79b;
+          tx_frame.FIR.B.DLC = 8;
+          tx_frame.data.u8[0] = 0x02;
+          tx_frame.data.u8[1] = 0x21;
+          tx_frame.data.u8[2] = 0x01;
+          tx_frame.data.u8[3] = 0x00;
+          tx_frame.data.u8[4] = 0x00;
+          tx_frame.data.u8[5] = 0x00;
+          tx_frame.data.u8[6] = 0x00;
+          tx_frame.data.u8[7] = 0x00;
+          Serial.println("Sending 79b");
+          send_can_frame(tx_frame);     
+        }
+      }
+    }
+  }
+}
+
+
+void loop() {
+  vTaskDelay(10);
+}
+
+
+void wifi_loop(void* task_time_us) {
+  init_ap();
+  init_webserver();
+  while (true) {
+    vTaskDelay(1000);
+  }
+}
+
+
+void logging_loop(void* task_time_us) {
+  unsigned long timestamp_prev_clear = 0;
+  unsigned long previousMillis = 0; 
+
+  while (true) {
+
+    unsigned long currentMillis = millis();
+
+    if (currentMillis - previousMillis >= 100) {
+      previousMillis = currentMillis;
+
+      // Logbuffer for webserver
+
+      if(pointer_log_buffer > 0) {
+        if (pointer_web_log_buffer + pointer_log_buffer + 20 < LOG_BUFFER_SIZE ) {
+          for (int i = 0; i < pointer_log_buffer + 1; i++) {
+            web_log_buffer[i + pointer_web_log_buffer] = log_buffer[i];
+          }
+          pointer_web_log_buffer += pointer_log_buffer;  
+        } else {
+          String s = "Log full, rotated<br>";
+          char temp_char[30];
+          sprintf(temp_char,"%s",s.c_str());
+          for (int i = 0; i < strlen(temp_char) + 1; i++) {
+            web_log_buffer[i + pointer_web_log_buffer] = temp_char[i];
+          }
+          pointer_web_log_buffer = strlen(temp_char);        
+        }
+        pointer_log_buffer = 0;
+      }
+
+      // Logbuffer for canframes (save to sd card)
+      if(pointer_can_log_buffer > 0) {
+        //Serial.printf("Before: %d,%d\n",pointer_can_log_buffer,millis());
+        memcpy(temp_buffer,can_log_buffer,pointer_can_log_buffer + 1);
+  //      for (int i = 0; i < pointer_can_log_buffer; i++) {
+  //        temp_buffer[i] = can_log_buffer[i];
+  //      }
+        pointer_can_log_buffer = 0;
+        if (get_candump_status()) { log2sd(temp_buffer); }
+        //Serial.printf("After: %d,%d\n",pointer_can_log_buffer,millis());
+      }
+    }
+    vTaskDelay(1);
+  }
+}
+
+void logger(String s) {
+  time_t now = time(NULL);
+  struct tm *tm_struct = localtime(&now);
+  int hour = tm_struct->tm_hour;
+  int min = tm_struct->tm_min;
+  int sec = tm_struct->tm_sec;
+
+  if (pointer_log_buffer + s.length() + 20 < LOG_BUFFER_SIZE ) {
+    char temp_char[255];
+    sprintf(temp_char,"%02d:%02d:%02d - %s<br>",hour,min,sec,s.c_str());
+    for (int i = 0; i < strlen(temp_char) + 1; i++) {
+      log_buffer[i + pointer_log_buffer] = temp_char[i];
+    }
+    pointer_log_buffer += strlen(temp_char);  
+  } 
+}
+
+void logger_can(CAN_frame_t frame, FRAME_DIRECTION fdir) {
+  char temp_char[255];
+  char temp_string[255];
+  char hexdata[255];
+  char log_string[255];
+  struct timeval tv;
+  gettimeofday(&tv, NULL); 
+  double ts = (1.0 * tv.tv_sec + 0.000001 * tv.tv_usec);
+  char time_stamp[255];
+  sprintf(time_stamp,"%.3f",ts);
+  for (int i = 0; i < frame.FIR.B.DLC; i++) {
+    unsigned char b = frame.data.u8[i];
+    sprintf(temp_char,"%02X",b);
+    hexdata[i * 2 + 0] = temp_char[0];
+    hexdata[i * 2 + 1] = temp_char[1];
+  }
+  hexdata[frame.FIR.B.DLC * 2 + 0] = 0;
+  sprintf(temp_string,"%03X",frame.MsgID);
+  char direction[10];
+  sprintf(direction,"RX");
+  if (fdir == TX_FRAME) { sprintf(direction,"TX"); }
+  sprintf(log_string,"(%s) %s %s#%s\n",time_stamp,direction,temp_string,hexdata);
+  if (pointer_can_log_buffer + strlen(log_string) + 20 < LOG_BUFFER_SIZE ) {
+    for (int i = 0; i < strlen(log_string) + 1; i++) {
+      can_log_buffer[i + pointer_can_log_buffer] = log_string[i];
+    }
+    pointer_can_log_buffer += strlen(log_string);  
+  } 
+  cancounter++;
+
+//  Serial.println(can_log_buffer);
+//if (get_candump_status()) { 
+
+}
+
 
 
 void read_preferences() {
@@ -150,12 +479,12 @@ void blink_led() {
   for(int i=0; i<200; i++) {
     pixels.setPixelColor(PIXEL, pixels.Color(0, i, 0));
     pixels.show();
-    delay(2);
+    vTaskDelay(2);
   }
   for(int i=200; i>-1; i--) {
     pixels.setPixelColor(PIXEL, pixels.Color(0, i, 0));
     pixels.show();
-    delay(5);
+    vTaskDelay(5);
   }
   pixels.clear();
 }
@@ -182,12 +511,7 @@ bool set_wake_up() {
     last_wake_up_timestamp = timestamp_now();
     show_led_wakeup_pin(1);
     // wake up using can...
-    CAN_frame_t tx_frame;
-    tx_frame.FIR.B.FF = CAN_frame_std;
-    tx_frame.MsgID = 0x679;
-    tx_frame.FIR.B.DLC = 1;
-    tx_frame.data.u8[0] = 0x00;
-    send_can_frame(tx_frame);
+    send_can_command(WAKE_UP);
 
     return true;
   } 
@@ -228,7 +552,6 @@ void send_can_stop_charge() {
   // before next one is sent.
   CAN_frame_t tx_frame;
   unsigned char new1db[8];
-
   logger("Sending stop_charge frames");
   tx_frame.FIR.B.FF = CAN_frame_std;
   tx_frame.MsgID = 0x1db;
@@ -246,11 +569,12 @@ void send_can_stop_charge() {
       old_can_1db[i] = new1db[i];
     }
     send_can_frame(tx_frame);
-    delay(1);
+    vTaskDelay(1);
   }
   should_send_stop_charge = 0;
 }
 
+/*
 void send_can_charge_complete() {
   // Get back to normal
   CAN_frame_t tx_frame;
@@ -272,11 +596,10 @@ void send_can_charge_complete() {
       old_can_1db[i] = new1db[i];
     }
     send_can_frame(tx_frame);
-    delay(1);
+    vTaskDelay(1);
   }
-  should_send_charge_complete = 0;
 }
-
+*/
 
 
 void init_ap() {
@@ -289,42 +612,6 @@ void init_ap() {
   Serial.println(myIP);
 }
 
-
-#define SEC_PER_DAY   86400
-#define SEC_PER_HOUR  3600
-#define SEC_PER_MIN   60
-
-void logger(String s) {
-  Serial.println(s);
-  while (log_semaphore == 1) {
-    delay(1);
-  }
-  time_t now = time(NULL);
-  struct tm *tm_struct = localtime(&now);
-  int hour = tm_struct->tm_hour;
-  int min = tm_struct->tm_min;
-  int sec = tm_struct->tm_sec;
-
-  log_semaphore = 1;
-  if (pointer_log_buffer + s.length() + 20 < LOG_BUFFER_SIZE ) {
-    char temp_char[255];
-    sprintf(temp_char,"%02d:%02d:%02d - %s<br>",hour,min,sec,s.c_str());
-//    sprintf(temp_char,"%.3f - %s<br>",ts,s.c_str());
-    for (int i = 0; i < strlen(temp_char) + 1; i++) {
-      log_buffer[i + pointer_log_buffer] = temp_char[i];
-    }
-    pointer_log_buffer += strlen(temp_char);  
-  } else {
-    log_semaphore = 0;
-    pointer_log_buffer = 0;
-    logger("Log full, rotated");
-  }
-  log_semaphore = 0;
-}
-
-String get_log() {
-  return String(log_buffer);
-}
 
 unsigned char leafcrc(int l, unsigned char * b){
   const unsigned char crcTable[]={0x0, 0x85, 0x8F, 0x0A, 0x9B, 0x1E, 0x14, 0x91, 0xB3, 0x36, 0x3C, 0xB9, 0x28, 0xAD, 0xA7, 0x22,
@@ -357,9 +644,18 @@ unsigned char leafcrc(int l, unsigned char * b){
 void check_can_bus() {
   CAN_frame_t rx_frame;  
   // Receive next CAN frame from queue
+
+//  if (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
   if (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 3 * portTICK_PERIOD_MS) == pdTRUE) {
     if (rx_frame.FIR.B.RTR != CAN_RTR) {
-      log2sd(rx_frame,RX_FRANE);
+
+      // only dump these frames...
+      if ( (rx_frame.MsgID == 0x1c2) || (rx_frame.MsgID == 0x59e) || (rx_frame.MsgID == 0x1d4) ||
+        (rx_frame.MsgID == 0x1db) ||  (rx_frame.MsgID == 0x55b) ||  (rx_frame.MsgID == 0x5bc) ||
+        (rx_frame.MsgID == 0x5bf) || (rx_frame.MsgID == 0x7bb) || (rx_frame.MsgID == 0x11a) ) {  
+        logger_can(rx_frame,RX_FRAME);
+      }
+
       if (rx_frame.MsgID == 0x1c2) {  
         battery_type = LEAF_ZE1;
       }
@@ -384,8 +680,8 @@ void check_can_bus() {
         hv_voltage = 0.5 * (rx_frame.data.u8[2] * 4 + ((rx_frame.data.u8[3] & 0xc0) >> 6));
 
         int hv_current_int = (rx_frame.data.u8[0] * 8 + ((rx_frame.data.u8[1] & 0xe0) >> 5));
-        if (hv_current_int & 1024) {
-          hv_current_int = - (1024 - hv_current_int);
+        if (hv_current_int > 1023) {
+          hv_current_int = - (2048 - hv_current_int);
         }
         hv_current = 0.5 * hv_current_int;
         //Serial.printf("I1:%d,%f,%f\n",hv_current_int,hv_current,hv_voltage);
@@ -397,9 +693,6 @@ void check_can_bus() {
         if (should_send_stop_charge == 1) {
           send_can_stop_charge();
         }
-        if (should_send_charge_complete == 1) {
-          send_can_charge_complete();
-        }
       }  
 
       if (rx_frame.MsgID == 0x55b) { // HVBAT, soc etc
@@ -407,6 +700,7 @@ void check_can_bus() {
         if (LB_TEMP != 0x3ff) {  //3FF is unavailable value
           timestamp_last_soc_received = timestamp_now();
           status_soc = 0.1 * LB_TEMP;
+//          Serial.printf("SoC:%f\n",status_soc);
         }
       }
       if (rx_frame.MsgID == 0x5bc) { // HVBAT
@@ -426,7 +720,7 @@ void check_can_bus() {
         }
         //Serial.printf("OBC message: plugged in:%d, charging:%d\n",is_plugged_in,is_charging);       
       }
-
+/*
       if (rx_frame.MsgID == 0x7bb) { // LBC info - groups
         if (rx_frame.data.u8[0] == 0x10) { // First response
           for (int i = 0; i < rx_frame.FIR.B.DLC; i++) {
@@ -476,265 +770,110 @@ void check_can_bus() {
           }
         }
       }
+      */
     }
   }
 }
 
-int led_counter = 0;
-
-void loop() {
-
-  check_can_bus();
-
-  if (timestamp_last_1d4_received - timestamp_now() > 30) {
-    status_car = 0;
-  }
-
-  // Car is on, wakeup pin should go low->high->low
-  if (status_car == 1) { 
-    if ((timestamp_now() - timestamp_car_went_on) < 3) {
-      clear_wake_up();
-    }
-    if ( ((timestamp_now() - timestamp_car_went_on) < 8) && ((timestamp_now() - timestamp_car_went_on) >3) ) {
-      set_wake_up();
-    }
-    if ((timestamp_now() - timestamp_car_went_on) > 8) {
-      clear_wake_up();
-    }
-  }
-
-  if (vcm_is_sleeping()) {
-    hq_hv_current = 0;
-    hq_hv_voltage = 0;
-    hq_status_soc = 0;
-    is_charging = 0;
-  }
-
-  if (USE_LED_FOR_STATUS == 1) {
-    int led_intensity = (int) (led_counter/10);
-    if (vcm_is_sleeping()) {
-      pixels.setPixelColor(PIXEL, pixels.Color(led_intensity, 0, 0));
-    } else {
-      pixels.setPixelColor(PIXEL, pixels.Color(0, led_intensity, 0));
-    }
-    pixels.show();
-
-    led_counter++;
-    if (led_counter > 500) { led_counter = 0;}
-  }
-
-  // Interval tasks
-  unsigned long currentMillis = millis();
-
-  if (currentMillis - previousMillis >= interval_base) {
-    previousMillis = currentMillis;
-    counter_check_timer++;  
-    counter_bat++;
-
-    // Send idle can message when vcm is awake - fool car that we still have a TCU
-    if (!vcm_is_sleeping()) {
-      if (!is_charging) {
-        if (status_car == 1) {
-          send_can_command("idle_car_on"); // 0x46 is sent from TCU when car is on
-        }
-        if (status_car == 2) {
-          send_can_command("idle"); // 0x86 is sent from TCU when car is off
-        } 
-      } else {
-          send_can_command("idle");
-      }
-    }
-
-    if (timer_is_enabled()) {
-      // check timer data
-      if (counter_check_timer > interval_check_timer) { 
-        Serial.println("Checking timer");     
-        if (!timer_is_active()) {
-          clear_wake_up();
-          previous_loop_timer_active = 0;
-        }
-
-        // If timer has changed from inactive to active, wake up the vcm (maybe we missed plugged in state etc)
-        if ( (timer_is_active()) && (previous_loop_timer_active == 0) && (vcm_is_sleeping()) ) {
-          logger("Timer went to active state, VCM is asleep - wake up...");
-          bool changed = set_wake_up();
-          previous_loop_timer_active = 1;
-        }
-
-        // Since the car will always try to charge when we plug in, we will probably know if it's plugged in or not. And a fairly updated SoC.
-        if ((timer_is_active()) && (status_soc<(timer_soc - soc_hysteresis)) && (is_plugged_in)) { // Only wake up when timer is enabled and soc is low
-          if (vcm_is_sleeping()) {
-            retry_stop_charge_counter = 0;
-            if ((timestamp_now() > retry_wake_up_at)) {
-              logger("Timer is active, VCM is asleep");
-              bool changed = set_wake_up();
-            }
-            if ((timestamp_now() > last_wake_up_timestamp + 60) && (timestamp_now() > retry_wake_up_at)) { // No can messages, but should be awake
-              logger("VCM should be awake, but I'm not getting anything.");
-              clear_wake_up();
-              retry_wake_up_at = timestamp_now() + 600;
-            }
-          } else { // can bus is active, soc is low
-            if ((!is_charging) && (status_soc<(timer_soc - soc_hysteresis)) ) {
-              logger("Timer is active and soc is lower than wanted, let's start to charge.");
-              send_can_command("start_charging");
-              charge_complete = 0;
-              soc_hysteresis = 0;
-            }
-          } 
-        } 
-
-        if ((timer_is_active()) && (is_charging) && (status_soc>timer_soc) ) {
-          charge_complete = 1;
-          soc_hysteresis = 2;
-          Serial.println(String(retry_stop_charge_counter));
-          if (retry_stop_charge_counter < 100) {
-            if (retry_stop_charge_counter == 0) { logger("Wanted SoC has been reached, trying to stop."); }
-            send_can_command("stop_charging");
-            retry_stop_charge_counter++;
-          } else {
-            if (retry_stop_charge_counter < 101) {
-              logger("Failed to stop charging when wanted SoC has been reached, giving up now.");
-              retry_stop_charge_counter++;
-            }
-          }
-        }
-
-        if ((timer_is_active()) && (!is_charging) && (status_soc>timer_soc) ) {
-          clear_wake_up();
-        }
-
-        if ((!timer_is_active()) && (is_charging)) {
-          charge_complete = 1;
-          if (retry_stop_charge_counter < 100) {
-            if (retry_stop_charge_counter == 0) { logger("Timer is not active, trying to stop charging."); }
-            set_wake_up();
-            send_can_command("stop_charging");
-            retry_wake_up_at = timestamp_now() + 900; // The VCM needs to be asleep a while before charging can be turned on again
-            retry_stop_charge_counter++;
-          } else {
-            if (retry_stop_charge_counter < 101) {
-              logger("Failed to stop charging when timer is not active, giving up now.");
-              clear_wake_up();
-              retry_stop_charge_counter++;
-            }
-          }
-        }
-        // Stopped and disabled charging, let's go back to normal
-        if ( (charge_complete == 1) && (!is_charging) ) {
-          charge_complete = 2;
-          logger("No longer charging, go back to normal");
-        }
-        counter_check_timer = 0;
-      }
-    }
-
-    // When charging, request battery details
-    if (GET_HIGH_PRECISION_INFO_FROM_BATTERY) {
-      if ((is_charging) && (!vcm_is_sleeping()) && (counter_bat > interval_bat)) { 
-        pointer_group_message = 0; // Reset the pointer (group request timeout)
-        group = 0;
-        counter_bat = 0;
-        CAN_frame_t tx_frame;
-        tx_frame.FIR.B.FF = CAN_frame_std;
-        tx_frame.MsgID = 0x79b;
-        tx_frame.FIR.B.DLC = 8;
-        tx_frame.data.u8[0] = 0x02;
-        tx_frame.data.u8[1] = 0x21;
-        tx_frame.data.u8[2] = 0x01;
-        tx_frame.data.u8[3] = 0x00;
-        tx_frame.data.u8[4] = 0x00;
-        tx_frame.data.u8[5] = 0x00;
-        tx_frame.data.u8[6] = 0x00;
-        tx_frame.data.u8[7] = 0x00;
-        Serial.println("Sending 79b");
-        send_can_frame(tx_frame);     
-      }
-    }
-  }
-}
 
 void send_can_frame(CAN_frame_t frame) {
   ESP32Can.CANWriteFrame(&frame);
-  log2sd(frame,TX_FRAME);
+  logger_can(frame,TX_FRAME);
+}
+
+void can_tx_loop() {
+  while (true) {
+    CAN_frame_t tx_frame;
+    tx_frame.FIR.B.FF = CAN_frame_std;
+    int num_frames_to_send = 25;
+    int interval_frame = 100;
+    int command = command2send;
+
+    if (command == WAKE_UP) { 
+      num_frames_to_send = 1;
+      tx_frame.MsgID = 0x679;
+      tx_frame.FIR.B.DLC = 1;
+      tx_frame.data.u8[0] = 0x00;
+    }
+
+    if (command == START_CHARGING) {
+      logger("Sending can messages to start charging");
+      tx_frame.MsgID = 0x56e;
+      tx_frame.FIR.B.DLC = 1;
+      tx_frame.data.u8[0] = 0x66;
+    }
+
+    if (command == IDLE_CAR_ON) {
+      num_frames_to_send = 1;
+      tx_frame.MsgID = 0x56e;
+      tx_frame.FIR.B.DLC = 1;
+      tx_frame.data.u8[0] = 0x46;
+    }
+    if (command == IDLE) {
+      num_frames_to_send = 1;
+      tx_frame.MsgID = 0x56e;
+      tx_frame.FIR.B.DLC = 1;
+      tx_frame.data.u8[0] = 0x86;
+    }
+    if (command == START_ACC) {
+      tx_frame.MsgID = 0x56e;
+      tx_frame.FIR.B.DLC = 1;
+      tx_frame.data.u8[0] = 0x4e;
+    }
+    if (command == STOP_ACC) {
+      tx_frame.MsgID = 0x56e;
+      tx_frame.FIR.B.DLC = 1;
+      tx_frame.data.u8[0] = 0x56;
+    }
+
+    if (command == STOP_CHARGING) { // 000200100000e3df
+      logger("Will send can messages to stop charging when next 1db frame arrives");
+      should_send_stop_charge = 1; // wait for LBC to send a 1db message, then immediately send x frames
+      num_frames_to_send = 0;
+    }
+
+    if (command == STOP_CHARGING_NOW) { 
+      // We use the frame that the LBC just sent, and modify a few bits (like ovms does).
+      // But, instead of spamming. We send eight frames (1ms interval) right after a 1db frame
+      // has been received. By sending eight, the next message from the LBC will have a correct
+      // prune counter. The interval for the LBC for 1db frames is 10ms, so we will fit those eight
+      // before next one is sent.
+      unsigned char new1db[8];
+      tx_frame.MsgID = 0x1db;
+      tx_frame.FIR.B.DLC = 8;
+      for (int i = 0; i < tx_frame.FIR.B.DLC; i++) {
+        new1db[i] = old_can_1db[i];
+      }
+      new1db[1] = (new1db[1] & 0xe0) | 2; // LB_Relay_Cut_Request
+      new1db[3] = new1db[3] | 0x10; // LB_Full_CHARGE_flag
+      new1db[6] = (new1db[6] + 1) % 4; // Increment LB_PRUN_1DB counter
+      new1db[7] = leafcrc(7, new1db); //  CRC
+      for (int i = 0; i < tx_frame.FIR.B.DLC; i++) {
+        tx_frame.data.u8[i] = new1db[i];
+        old_can_1db[i] = new1db[i];
+      }
+      num_frames_to_send = 8;
+      interval_frame = 1;
+      logger("Sending stop_charge frames");
+      should_send_stop_charge = 0;
+    }
+
+    if (command != NONE) {  
+      int counter = 0;
+      while (counter < num_frames_to_send) {
+        send_can_frame(tx_frame);
+        vTaskDelay(interval_frame);
+        counter++;
+      }
+      command2send = NONE;
+    }
+    vTaskDelay(1);
+  }
 }
 
 
-
-void send_can_command(String command) {
-  CAN_frame_t tx_frame;
-  tx_frame.FIR.B.FF = CAN_frame_std;
-  int num_frames_to_send = 25;
-  int interval_frame = 100;
-
-  if (command == "charge_complete") { 
-    logger("Will send can messages for:" + command + " when next 1db frame arrives");
-    should_send_charge_complete = 1; // wait for LBC to send a 1db message, then immediately send x frames
-    return;
-  }
-
-
-
-  if (command == "start_charging") {
-    logger("Sending can messages for:" + command);
-    tx_frame.MsgID = 0x56e;
-    tx_frame.FIR.B.DLC = 1;
-    tx_frame.data.u8[0] = 0x66;
-  }
-  if (command == "idle_car_on") {
-    num_frames_to_send = 1;
-    tx_frame.MsgID = 0x56e;
-    tx_frame.FIR.B.DLC = 1;
-    tx_frame.data.u8[0] = 0x46;
-  }
-  if (command == "idle") {
-    num_frames_to_send = 1;
-    tx_frame.MsgID = 0x56e;
-    tx_frame.FIR.B.DLC = 1;
-    tx_frame.data.u8[0] = 0x86;
-  }
-  if (command == "status") {
-    num_frames_to_send = 1;
-    tx_frame.MsgID = 0x56e;
-    tx_frame.FIR.B.DLC = 1;
-    tx_frame.data.u8[0] = 0x46;
-  }
-  if (command == "start_acc") {
-    tx_frame.MsgID = 0x56e;
-    tx_frame.FIR.B.DLC = 1;
-    tx_frame.data.u8[0] = 0x4e;
-  }
-  if (command == "stop_acc") {
-    tx_frame.MsgID = 0x56e;
-    tx_frame.FIR.B.DLC = 1;
-    tx_frame.data.u8[0] = 0x56;
-  }
-  if (command == "stop_charging") { // 000200100000e3df
-    logger("Will send can messages for:" + command + " when next 1db frame arrives");
-    should_send_stop_charge = 1; // wait for LBC to send a 1db message, then immediately send x frames
-    return;
-    /*
-    tx_frame.MsgID = 0x1db;
-    tx_frame.FIR.B.DLC = 8;
-    tx_frame.data.u8[0] = 0x00;
-    tx_frame.data.u8[1] = 0x02;
-    tx_frame.data.u8[2] = 0x00;
-    tx_frame.data.u8[3] = 0x10;
-    tx_frame.data.u8[4] = 0x00;
-    tx_frame.data.u8[5] = 0x00;
-    tx_frame.data.u8[6] = 0xe3;
-    tx_frame.data.u8[7] = 0xdf;   
-    interval_frame = 1;
-    num_frames_to_send = 10;
-    */
-  }
- 
-  int counter = 0;
-  while (counter < num_frames_to_send) {
-    send_can_frame(tx_frame);
-    delay(interval_frame);
-    counter++;
-  }
+void send_can_command(int command) {
+  command2send = command;
 }
 
 
@@ -850,6 +989,9 @@ long string2long(String temp_string) {
 }
 
 // Web-server related below...
+String get_log() {
+  return String(web_log_buffer);
+}
 
 void notFound(AsyncWebServerRequest* request) {
   request->send(404, "text/plain", "Not found");
@@ -879,7 +1021,7 @@ void init_webserver() {
 
   server.on("/start_charging", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (!timer_is_enabled()) {
-      send_can_command("start_charging");
+      send_can_command(START_CHARGING);
       html_message = "Start charging can messages sent!";
     } else {
       html_message = "Refuse to start when timer is enabled!";
@@ -888,19 +1030,19 @@ void init_webserver() {
   });
 
   server.on("/stop_charging", HTTP_GET, [](AsyncWebServerRequest* request) {
-    send_can_command("stop_charging");
+    send_can_command(STOP_CHARGING);
     html_message = "Stop charging can messages sent!";
     request->send_P(200, "text/html", control_html, processor);
   });
 
   server.on("/start_acc", HTTP_GET, [](AsyncWebServerRequest* request) {
-    send_can_command("start_acc");
+    send_can_command(START_ACC);
     html_message = "Start ACC can messages sent!";
     request->send_P(200, "text/html", control_html, processor);
   });
 
   server.on("/stop_acc", HTTP_GET, [](AsyncWebServerRequest* request) {
-    send_can_command("stop_acc");
+    send_can_command(STOP_ACC);
     html_message = "Stop ACC can messages sent!";
     request->send_P(200, "text/html", control_html, processor);
   });
@@ -964,20 +1106,32 @@ void init_webserver() {
     logger("Clock set");
   });
 
+  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest* request) {
+    html_message = "Will reset in 5 seconds!";
+    request->send_P(200, "text/html", message_html, processor);
+    logger("Resetting");
+    vTaskDelay(5000);
+    shutdown_tasks();
+    ESP.restart();
+  });
+
   server.on("/log", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (request->hasParam("candump")) {
       candump = string2long(request->getParam("candump")->value());
       if (candump == 1) {
         resume_can_writing();
         logger("start candump");
-      } else {
+      } 
+      if (candump == 0) {
         pause_can_writing();
         logger("stop candump");
       }
+      if (candump == 2) {
+        delete_can_log();
+        logger("delete candump file");
+      }
     }
-    while (log_semaphore == 1) {
-      delay(1);
-    }
+    vTaskDelay(100);
     log_semaphore = 1;
     request->send_P(200, "text/html", log_html, processor);
     log_semaphore = 0;
@@ -998,9 +1152,9 @@ String processor(const String& var)
 
   if(var == "DIV_STATUS_STYLE") {
     String content = "";
-    if (timestamp_last_soc_received <= 0) {
-      content = "style='display: none;'";
-    }
+//    if (timestamp_last_soc_received <= 0) {
+//      content = "style='display: none;'";
+//    }
     return content;
   } 
 
@@ -1057,10 +1211,10 @@ String processor(const String& var)
     if (vcm_is_sleeping()) {
       font_p = "<p style='color:red;'>";
     }
-    if (timestamp_last_soc_received <= 0) {
-      content += String(font_p) + "No SoC can messages seen yet</p>";
+    if (timestamp_last_1d4_received <= 0) {
+      content += String(font_p) + "No can messages from VCM seen yet</p>";
     } else {
-      content += String(font_p) + "Last can message with SoC seen: " + String(seconds_since_can_data(timestamp_last_soc_received)) + "s ago</p>";
+      content += String(font_p) + "Last can message from VCM seen: " + String(seconds_since_can_data(timestamp_last_1d4_received)) + "s ago</p>";
     }
     return content;
   } 
@@ -1097,6 +1251,19 @@ String processor(const String& var)
     content += "HV Status: " + String(status) + "<br>";
     return content;
   }
+
+  if(var == "CHARGE_TIME") {
+    String content = "";
+    String status = "";
+    float capacity_left_to_soc = 0.01 * battery_capacity_new * status_soh * (timer_soc - status_soc);
+    float c = std::trunc(capacity_left_to_soc / 1000) / 100.0;
+    float time_left_hours = c/2;
+    float time_left = std::trunc(time_left_hours * 100) / 100.0;
+    content += "Charge to wanted SoC: " + String(c) + "kWh, " + String(time_left) + "h @2kW<br>";
+    return content;
+  } 
+
+
 
   if(var == "HV_POWER") {
     String content = "";
@@ -1163,12 +1330,21 @@ String processor(const String& var)
 
   if(var == "SD_CARD") {
     String content = "";
+    String content2 = "";
     if (get_sdcard_status()) {
       content = "SD Card is ok";      
     } else {
       content = "SD Card is not ok";      
     }
-    return content;
+    if (get_candump_file_status()) {
+      long fs = get_file_size();
+      content2 = ", file is there, " + String(fs) + " bytes";      
+    } else {
+      content2 = ", no file";      
+    }
+
+
+    return content + content2;
   } 
 
   if(var == "CANDUMP") {

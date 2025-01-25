@@ -69,6 +69,7 @@ const char div_overview_html[] = R"rawliteral(
 %CAR_STATUS%<br>
 %HV_STATUS%<br>
 %HV_POWER%<br>
+%CHARGE_TIME%<br>
 %BATTERY_TYPE%
 </div>
 )rawliteral";
@@ -186,7 +187,7 @@ a.button {
 <body>
 <h1>Leaf timer - Manual Control</h1>
 %LINKS%<br>
-<a href='/wake_up' class='button'>Wake up VCM</a>&nbsp<a href='/sleep' class='button'>VCM Sleep</a><br><br>
+<a href='/wake_up' class='button'>Wake up VCM</a>&nbsp<a href='/sleep' class='button'>VCM Sleep</a>&nbsp<a href='/reset' class='button'>Reset</a><br><br>
 <a href='/start_charging' class='button'>Start charging</a>&nbsp;<a href='/stop_charging' class='button'>Stop charging</a>&nbsp<a href='/start_acc' class='button'>Start ACC</a>&nbsp;<a href='/stop_acc' class='button'>Stop ACC</a>
 <br><br>
 <div align="left">
@@ -238,7 +239,7 @@ a.button {
 <body>
 <h1>Leaf timer - Log</h1>
 %LINKS%<br>
-<a href='/log?candump=1' class='button'>Start candump to SD</a>&nbsp<a href='log?candump=0' class='button'>Stop candump to SD</a><br><br>
+<a href='/log?candump=1' class='button'>Start candump to SD</a>&nbsp<a href='log?candump=0' class='button'>Stop candump to SD</a>&nbsp<a href='log?candump=2' class='button'>Delete candump file</a><br><br>
 %CANDUMP%, %SD_CARD%
 <br>
 <br>

@@ -5,7 +5,6 @@
     defined(SD_MISO_PIN)  // ensure code is only compiled if all SD card pins are defined
 
 File can_log_file;
-RingbufHandle_t can_bufferHandle;
 
 bool can_logging_paused = true;
 bool can_file_open = false;
@@ -13,8 +12,8 @@ bool delete_can_file = false;
 bool sd_card_active = false;
 
 void delete_can_log() {
-  can_logging_paused = true;
-  delete_can_file = true;
+  SD.remove(CAN_LOG_FILE);
+  delete_can_file = false;
 }
 
 void resume_can_writing() {
@@ -38,12 +37,35 @@ void pause_can_writing() {
   }
 }
 
+long get_file_size() {
+  long f_size = 0;
+
+  if (SD.exists(CAN_LOG_FILE)) {
+    if (can_file_open == false) {
+      can_log_file = SD.open(CAN_LOG_FILE, FILE_APPEND);
+      f_size = can_log_file.size();
+      can_log_file.close();
+    } else {
+      f_size = can_log_file.size();
+    }
+  }
+  return f_size;
+}
+
 bool get_sdcard_status() {
   if (SD.cardType() == CARD_NONE) {
     return false;
   }
   return true;
 }
+
+bool get_candump_file_status() {
+  if (SD.exists(CAN_LOG_FILE)) {
+    return true;
+  }
+  return false;
+}
+
 
 bool get_candump_status() {
   if (can_logging_paused) {
@@ -52,91 +74,13 @@ bool get_candump_status() {
   return true;
 }
 
-void log2sd(CAN_frame_t frame, FRAME_DIRECTION fdir) {
-  char temp_char[255];
-  char temp_string[255];
-  char hexdata[255];
-  char log_string[255];
-  struct timeval tv;
-  gettimeofday(&tv, NULL); 
-  double ts = (1.0 * tv.tv_sec + 0.000001 * tv.tv_usec);
-  char time_stamp[255];
-  sprintf(time_stamp,"%.3f",ts);
-  for (int i = 0; i < frame.FIR.B.DLC; i++) {
-    unsigned char b = frame.data.u8[i];
-    sprintf(temp_char,"%02X",b);
-    hexdata[i * 2 + 0] = temp_char[0];
-    hexdata[i * 2 + 1] = temp_char[1];
-  }
-  hexdata[frame.FIR.B.DLC * 2 + 0] = 0;
-  sprintf(temp_string,"%03X",frame.MsgID);
-  char direction[10];
-  sprintf(direction,"RX");
-  if (fdir == TX_FRAME) { sprintf(direction,"TX"); }
-  sprintf(log_string,"(%s) %s %s#%s\n",time_stamp,direction,temp_string,hexdata);
-  can_log_file.print(log_string);
+void log2sd(String s) {
+//  char log_string[4096];
+//  sprintf(log_string,"%s",s);
+  can_log_file.print(s);
   //Serial.printf("%s",log_string);
 }
 
-
-
-void add_can_frame_to_log(CAN_frame_t frame, frameDirection msgDir) {
-
-  if (!sd_card_active)
-    return;
-
-  //CAN_log_frame log_frame = {frame, msgDir};
-}
-
-void write_can_frame_to_sdcard() {
-
-  if (!sd_card_active)
-    return;
-
-  size_t receivedMessageSize;
-  CAN_log_frame* log_frame =
-      (CAN_log_frame*)xRingbufferReceive(can_bufferHandle, &receivedMessageSize, pdMS_TO_TICKS(10));
-
-  if (log_frame != NULL) {
-
-    if (can_logging_paused) {
-      if (can_file_open) {
-        can_log_file.close();
-        can_file_open = false;
-      }
-      if (delete_can_file) {
-        SD.remove(CAN_LOG_FILE);
-        delete_can_file = false;
-        can_logging_paused = false;
-      }
-      vRingbufferReturnItem(can_bufferHandle, (void*)log_frame);
-      return;
-    }
-
-    if (can_file_open == false) {
-      can_log_file = SD.open(CAN_LOG_FILE, FILE_APPEND);
-      can_file_open = true;
-    }
-
-    uint8_t i = 0;
-    can_log_file.print("(");
-    can_log_file.print(millis() / 1000.0);
-    (log_frame->direction == MSG_RX) ? can_log_file.print(") RX0 ") : can_log_file.print(") TX1 ");
-    can_log_file.print(log_frame->frame.ID, HEX);
-    can_log_file.print(" [");
-    can_log_file.print(log_frame->frame.DLC);
-    can_log_file.print("] ");
-    for (i = 0; i < log_frame->frame.DLC; i++) {
-      can_log_file.print(log_frame->frame.data.u8[i] < 16 ? "0" : "");
-      can_log_file.print(log_frame->frame.data.u8[i], HEX);
-      if (i < log_frame->frame.DLC - 1)
-        can_log_file.print(" ");
-    }
-    can_log_file.println("");
-
-    vRingbufferReturnItem(can_bufferHandle, (void*)log_frame);
-  }
-}
 
 void init_sdcard() {
 
