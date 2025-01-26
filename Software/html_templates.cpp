@@ -74,6 +74,42 @@ const char div_overview_html[] = R"rawliteral(
 </div>
 )rawliteral";
 
+const char wifi_html[] = R"rawliteral(
+<!doctypehtml><title>Leaf Wifi</title>
+<meta content="width=device-width"name=viewport><style>html{font-family:Arial;display:inline-block;text-align:center}h2{font-size:3rem}body{max-width:800px;margin:0 auto}
+a.button {
+    padding: 1px 6px;
+    border: 1px outset buttonborder;
+    border-radius: 3px;
+    color: buttontext;
+    background-color: buttonface;
+    text-decoration: none;
+}</style>
+<body>
+<h1>Wifi settings</h1>
+%LINKS%<br>
+<form action='/wifi_set'>
+AP Password:<input type='password' id='ap_password' name='ap_password' value='%AP_PASSWORD%'><br><br>
+Connect to WLAN: <select name="wlan_connect">
+  <option %WLAN_CONNECT_1% value="1">Yes</option>
+  <option %WLAN_CONNECT_0% value="0">No</option>
+</select><br><br>
+<a href='/wifi_connect' class='button'>Connect now</a>&nbsp<br><br>
+WLAN is %WLAN_STATUS%<br><br>
+WLAN SSID:<input type='text' id='wlan_ssid' name='wlan_ssid' value='%WLAN_SSID%'><br><br>
+WLAN Password:<input type='password' id='wlan_password' name='wlan_password' value='%WLAN_PASSWORD%'><br><br>
+<br><input type="submit" value="Save" />
+</form>
+<div>
+<br><br>
+<div id="message" align="center" class="%DIV_MESSAGE_CLASS%">
+<br>
+%MESSAGE%<br>
+<br>
+</div>
+</body>
+)rawliteral";
+
 
 const char timer_html[] = R"rawliteral(
 <!doctypehtml><title>Leaf Timer</title>

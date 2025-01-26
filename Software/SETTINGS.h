@@ -1,6 +1,6 @@
-//Password to WLAN access point
-#define AP_SSID "caroftheyear2011"
-#define AP_PASSWORD "1234123412341234"
+//Password to WLAN access point - default values, if not saved in flash
+#define AP_SSID_DEFAULT "caroftheyear2011"
+#define AP_PASSWORD_DEFAULT "1234123412341234"
 
 //Name and password of Wifi network you want the emulator to connect to
 #define WIFI_SSID "MY_SSID"          

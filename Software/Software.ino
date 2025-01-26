@@ -29,8 +29,14 @@ enum FRAME_DIRECTION { RX_FRAME, TX_FRAME };
 enum COMMAND_TYPE { NONE,START_CHARGING,STOP_CHARGING,STOP_CHARGING_NOW,START_ACC,STOP_ACC,WAKE_UP,IDLE_CAR_ON,IDLE }; 
 
 
-const char *ssid = AP_SSID;
-const char *password = AP_PASSWORD;
+//const char *ssid = AP_SSID;
+//const char *password = AP_PASSWORD;
+
+char ap_ssid[64];
+char ap_password[64];
+char wlan_ssid[64];
+char wlan_password[64];
+
 
 AsyncWebServer server(80);
 
@@ -54,6 +60,7 @@ Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 #define LOG_BUFFER_SIZE 4096
 
+int retry_wlan_counter = 3;
 int command2send = 0;
 int candump = 0;
 int state_wake_up_pin = 0;
@@ -71,6 +78,7 @@ float hv_current = 0;
 float hq_hv_voltage = 0;
 float hq_hv_current = 0;
 int timer_enabled = 0;
+int wlan_connect = 0;
 String timer_start = "23:00";
 String timer_stop = "05:00";
 String html_message = "";
@@ -333,7 +341,13 @@ void wifi_loop(void* task_time_us) {
   init_ap();
   init_webserver();
   while (true) {
-    vTaskDelay(1000);
+    vTaskDelay(2000);
+    if (retry_wlan_counter > 0) {
+      if (!wifi_connected()) {
+        connect_wlan();
+        retry_wlan_counter--;
+      }
+    }
   }
 }
 
@@ -441,23 +455,46 @@ void logger_can(CAN_frame_t frame, FRAME_DIRECTION fdir) {
 
 void read_preferences() {
   Preferences preferences;
-  char temp_string[10];
+  char temp_string[64];
 
   preferences.begin("leaf-timer", true);
   timer_enabled = preferences.getUInt("timer_enabled", 0);
   timer_soc = preferences.getUInt("timer_soc", 0);
   size_t l_string = preferences.getString("timer_start", temp_string, sizeof(temp_string));
-  if (l_string > 0) {  // Successfully read the string from memory. Set it to SSID!
+  if (l_string > 0) { 
     timer_start = temp_string;
   } else {
     timer_start = "23:15";
   }
   l_string = preferences.getString("timer_stop", temp_string, sizeof(temp_string));
-  if (l_string > 0) {  // Successfully read the string from memory. Set it to SSID!
+  if (l_string > 0) { 
     timer_stop = temp_string;
   } else {
     timer_stop = "05:15";
   }
+
+  l_string = preferences.getString("ap_password", temp_string, sizeof(temp_string));
+  if (l_string > 0) { 
+    memcpy(ap_password,temp_string,sizeof(temp_string));
+  } else {
+    memcpy(ap_password,AP_PASSWORD_DEFAULT,sizeof(AP_PASSWORD_DEFAULT));
+  }
+  memcpy(ap_ssid,AP_SSID_DEFAULT,sizeof(AP_SSID_DEFAULT));
+
+  wlan_connect = preferences.getUInt("wlan_connect", 0);
+  l_string = preferences.getString("wlan_ssid", temp_string, sizeof(temp_string));
+  if (l_string > 0) { 
+    memcpy(wlan_ssid,temp_string,sizeof(temp_string));
+  } else {
+    wlan_connect = 0;
+  }
+  l_string = preferences.getString("wlan_password", temp_string, sizeof(temp_string));
+  if (l_string > 0) { 
+    memcpy(wlan_password,temp_string,sizeof(temp_string));
+  } else {
+    wlan_connect = 0;
+  }
+
   preferences.end();
 }
 
@@ -468,6 +505,10 @@ void write_preferences() {
   preferences.putUInt("timer_soc", timer_soc);
   preferences.putString("timer_start", String(timer_start.c_str()));
   preferences.putString("timer_stop", String(timer_stop.c_str()));
+  preferences.putString("ap_password", String(ap_password));
+  preferences.putUInt("wlan_connect", wlan_connect);
+  preferences.putString("wlan_password", String(wlan_password));
+  preferences.putString("wlan_ssid", String(wlan_ssid));
   preferences.end();
 }
 
@@ -603,15 +644,42 @@ void send_can_charge_complete() {
 
 
 void init_ap() {
-  if (!WiFi.softAP(ssid, password)) {
+  if (wlan_connect == 1) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_STA);
+  }
+  if (!WiFi.softAP(ap_ssid, ap_password)) {
     Serial.println("Soft AP creation failed.");
     while (1);
   }
   IPAddress myIP = WiFi.softAPIP();
   Serial.print("AP IP address: ");
   Serial.println(myIP);
+  // Set WiFi to auto reconnect
+  WiFi.setAutoReconnect(false);
+  connect_wlan();
 }
 
+
+
+void connect_wlan() {
+  const uint8_t wifi_channel = 0; 
+  logger("Connecting to wlan");
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Connecting to wlan...");
+    WiFi.begin(wlan_ssid, wlan_password, wifi_channel);
+  } else {
+    Serial.println("wlan already connected.");
+  }
+}
+
+bool wifi_connected() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+  return false;
+}
 
 unsigned char leafcrc(int l, unsigned char * b){
   const unsigned char crcTable[]={0x0, 0x85, 0x8F, 0x0A, 0x9B, 0x1E, 0x14, 0x91, 0xB3, 0x36, 0x3C, 0xB9, 0x28, 0xAD, 0xA7, 0x22,
@@ -670,6 +738,10 @@ void check_can_bus() {
         if ( ((old_status_car == 2) || (old_status_car == 0)) && (status_car == 1)) {
           timestamp_car_went_on = timestamp_now(); 
         }
+        if ( (old_status_car == 1) && (status_car != 1)) {
+          retry_wlan_counter = 3;
+        }
+
         timestamp_last_11a_received = timestamp_now();        
       } 
       if (rx_frame.MsgID == 0x1d4) { // VCM sending
@@ -1006,6 +1078,36 @@ void init_webserver() {
     request->send_P(200, "text/html", div_overview_html, processor);
   });
 
+  server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", wifi_html, processor);
+  });
+
+  server.on("/wifi_connect", HTTP_GET, [](AsyncWebServerRequest* request) {
+    connect_wlan();
+    html_message = "Trying to connect to wlan!";
+    request->send_P(200, "text/html", wifi_html, processor);
+  });
+
+  server.on("/wifi_set", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("wlan_connect")) {
+      wlan_connect = string2int(request->getParam("wlan_connect")->value());
+      String tmp_string = request->getParam("ap_password")->value();
+      memcpy(ap_password,tmp_string.c_str(),64);
+      tmp_string = request->getParam("wlan_password")->value();
+      memcpy(wlan_password,tmp_string.c_str(),64);
+      tmp_string = request->getParam("wlan_ssid")->value();
+      memcpy(wlan_ssid,tmp_string.c_str(),64);
+      html_message = "Wifi settings saved!";
+      write_preferences();
+      Serial.printf("wlan_ssid:%s,%s\n",wlan_ssid,wlan_password);
+      logger("Wifi settings saved");
+    } else {
+      html_message = "No params found in request";
+    }
+    request->send_P(200, "text/html", message_html, processor);
+  });
+
+
   server.on("/timer", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send_P(200, "text/html", timer_html, processor);
   });
@@ -1146,7 +1248,7 @@ void init_webserver() {
 String processor(const String& var)
 {
   if(var == "LINKS") {
-    String content = "<a href='/' class='button'>Overview</a>&nbsp;<a href='/timer' class='button'>Set timer</a>&nbsp;<a href='/clock' class='button'>Set clock</a>&nbsp;<a href='/control' class='button'>Manual Control</a>&nbsp;<a href='/log' class='button'>Log</a><br><hr>";
+    String content = "<a href='/' class='button'>Overview</a>&nbsp;<a href='/timer' class='button'>Set timer</a>&nbsp;<a href='/clock' class='button'>Set clock</a>&nbsp;<a href='/control' class='button'>Manual Control</a>&nbsp;<a href='/wifi' class='button'>Wifi</a>&nbsp;<a href='/log' class='button'>Log</a><br><hr>";
     return content;
   }
 
@@ -1293,11 +1395,6 @@ String processor(const String& var)
     content += "Battery type: " + String(status) + "<br>";
     return content;
   }
-  if(var == "TIMER_ENABLED_0") {
-    String content = "";
-    if (timer_enabled == 0) { content = "selected"; }
-    return content;
-  } 
   if(var == "WAKE_UP") {
     String content = "";
     content += "Wake up bit: " + String(state_wake_up_pin) + "<br>";
@@ -1317,6 +1414,11 @@ String processor(const String& var)
     if (timer_enabled == 1) { content = "selected"; }
     return content;
   } 
+  if(var == "TIMER_ENABLED_0") {
+    String content = "";
+    if (timer_enabled == 0) { content = "selected"; }
+    return content;
+  } 
   if(var == "DIV_MESSAGE_CLASS") {
     String content = "";
     if (html_message == "") {
@@ -1326,7 +1428,33 @@ String processor(const String& var)
     }
     return content;
   } 
+  if(var == "WLAN_CONNECT_0") {
+    String content = "";
+    if (wlan_connect == 0) { content = "selected"; }
+    return content;
+  } 
+  if(var == "WLAN_CONNECT_1") {
+    String content = "";
+    if (wlan_connect == 1) { content = "selected"; }
+    return content;
+  } 
+  if(var == "AP_PASSWORD") {
+    return String(ap_password);
+  }
 
+  if(var == "WLAN_STATUS") {
+    if (wifi_connected()) {
+      return String("connected");
+    }
+    return String("not connected");
+  }
+
+  if(var == "WLAN_SSID") {
+    return String(wlan_ssid);
+  }
+  if(var == "WLAN_PASSWORD") {
+    return String(wlan_password);
+  }
 
   if(var == "SD_CARD") {
     String content = "";
