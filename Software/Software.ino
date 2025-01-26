@@ -344,7 +344,9 @@ void wifi_loop(void* task_time_us) {
     vTaskDelay(2000);
     if (retry_wlan_counter > 0) {
       if (!wifi_connected()) {
-        connect_wlan();
+        if (wlan_connect == 1) {
+          connect_wlan();
+        }
         retry_wlan_counter--;
       }
     }
@@ -647,7 +649,7 @@ void init_ap() {
   if (wlan_connect == 1) {
     WiFi.mode(WIFI_AP_STA);
   } else {
-    WiFi.mode(WIFI_STA);
+    WiFi.mode(WIFI_AP);
   }
   if (!WiFi.softAP(ap_ssid, ap_password)) {
     Serial.println("Soft AP creation failed.");
@@ -658,7 +660,6 @@ void init_ap() {
   Serial.println(myIP);
   // Set WiFi to auto reconnect
   WiFi.setAutoReconnect(false);
-  connect_wlan();
 }
 
 
@@ -680,6 +681,17 @@ bool wifi_connected() {
   }
   return false;
 }
+
+String wifi_ip_address() {
+  if (wifi_connected()) {
+    IPAddress myIP = WiFi.localIP();
+    Serial.print("AP IP address: ");
+    Serial.println(myIP);
+    return myIP.toString();
+  }
+  return "";
+}
+
 
 unsigned char leafcrc(int l, unsigned char * b){
   const unsigned char crcTable[]={0x0, 0x85, 0x8F, 0x0A, 0x9B, 0x1E, 0x14, 0x91, 0xB3, 0x36, 0x3C, 0xB9, 0x28, 0xAD, 0xA7, 0x22,
@@ -1365,8 +1377,6 @@ String processor(const String& var)
     return content;
   } 
 
-
-
   if(var == "HV_POWER") {
     String content = "";
     String status = "";
@@ -1444,7 +1454,7 @@ String processor(const String& var)
 
   if(var == "WLAN_STATUS") {
     if (wifi_connected()) {
-      return String("connected");
+      return String("connected, " + wifi_ip_address());
     }
     return String("not connected");
   }
