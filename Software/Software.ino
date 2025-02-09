@@ -14,7 +14,6 @@
 #include "Preferences.h"
 #include "src/sdcard.h"
 
-int cancounter = 0;
 
 #define CONFIG_ASYNC_TCP_MAX_ACK_TIME=5000   // (keep default)
 #define CONFIG_ASYNC_TCP_PRIORITY=10         // (keep default)
@@ -58,9 +57,10 @@ Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 #define LEAF_AZE0 1
 #define LEAF_ZE1 2
 
-#define LOG_BUFFER_SIZE 4096
+#define LOG_BUFFER_SIZE 8192
 
-int retry_wlan_counter = 3;
+int counter_can = 0;
+int counter_retry_wlan = 3;
 int command2send = 0;
 int candump = 0;
 int state_wake_up_pin = 0;
@@ -85,6 +85,14 @@ String html_message = "";
 int timer_soc = 80;
 int soc_hysteresis = 0;
 
+int last_steering_wheel_button = 0;
+float cc_outside_temp = 0;
+float cc_inside_temp = 0;
+float cc_set_temp = 0;
+int cc_status = 0;
+int cc_fanspeed = 0;
+int cc_fan_target = 0;
+int cc_fan_intake = 0;
 long timestamp_last_soc_received = -600;  // Timestamp when can message with soc was rec
 long timestamp_last_11a_received = -600;  // Timestamp when can message with 11a was rec
 long timestamp_last_1d4_received = -600;  // Timestamp when can message with 1d4 was rec
@@ -102,10 +110,10 @@ char log_buffer[LOG_BUFFER_SIZE];
 int pointer_log_buffer = 0;
 char web_log_buffer[LOG_BUFFER_SIZE];
 int pointer_web_log_buffer = 0;
-char can_log_buffer[8192];
+char can_log_buffer1[LOG_BUFFER_SIZE];
+char can_log_buffer2[LOG_BUFFER_SIZE];
+int can_log_buffer_rx = 1;
 int pointer_can_log_buffer = 0;
-char temp_buffer[8192];
-
 
 int log_semaphore = 0;
 u_char old_can_1db[16];
@@ -115,19 +123,19 @@ int should_send_stop_charge = 0;
 
 TaskHandle_t th_wifi_loop_task;
 #define CORE_WIFI 0
-#define TASK_WIFI_PRIO 6
+#define TASK_WIFI_PRIO 2
 
 TaskHandle_t th_logging_loop_task;
 #define CORE_LOGGING 0
-#define TASK_LOGGING_PRIO 2
+#define TASK_LOGGING_PRIO 8
 
 TaskHandle_t th_can_rx_loop_task;
 #define CORE_MAIN 1
-#define TASK_CANRX_PRIO 4
+#define TASK_CANRX_PRIO 6
 
 TaskHandle_t th_can_tx_loop_task;
 #define CORE_MAIN 1
-#define TASK_CANTX_PRIO 2
+#define TASK_CANTX_PRIO 4
 
 //#define TASK_CORE_PRIO 4
 //#define TASK_MODBUS_PRIO 8
@@ -136,6 +144,7 @@ TaskHandle_t th_can_tx_loop_task;
 void setup() {
   read_preferences();
   init_time();
+  blink_led();
   Serial.begin(115200);
   Serial.println();
   Serial.println("Starting Leaf timer");
@@ -143,10 +152,10 @@ void setup() {
   pinMode(WAKE_UP_PIN, OUTPUT);  
   state_wake_up_pin = 0;
   digitalWrite(WAKE_UP_PIN,state_wake_up_pin);
+  show_led_wakeup_pin(0);
   init_can();
   createCoreTasks();
   init_sdcard();
-  blink_led();
 }
 
 void createCoreTasks() {
@@ -182,16 +191,18 @@ void can_rx_loop() {
       status_car = 0;
     }
 
-    // Car is on, wakeup pin should go low->high->low
-    if (status_car == 1) { 
-      if ((timestamp_now() - timestamp_car_went_on) < 3) {
-        clear_wake_up();
-      }
-      if ( ((timestamp_now() - timestamp_car_went_on) < 8) && ((timestamp_now() - timestamp_car_went_on) >3) ) {
-        set_wake_up();
-      }
-      if ((timestamp_now() - timestamp_car_went_on) > 8) {
-        clear_wake_up();
+    if (FAKE_TCU == 1) {
+      // Car is on, wakeup pin should go low->high->low
+      if (status_car == 1) { 
+        if ((timestamp_now() - timestamp_car_went_on) < 3) {
+          clear_wake_up();
+        }
+        if ( ((timestamp_now() - timestamp_car_went_on) < 8) && ((timestamp_now() - timestamp_car_went_on) >3) ) {
+          set_wake_up();
+        }
+        if ((timestamp_now() - timestamp_car_went_on) > 8) {
+          clear_wake_up();
+        }
       }
     }
 
@@ -211,26 +222,34 @@ void can_rx_loop() {
       counter_check_timer++;  
       counter_bat++;
 
-      // Send idle can message when vcm is awake - fool car that we still have a TCU
-      if (!vcm_is_sleeping()) {
-        if (status_car != 1) { clear_wake_up(); }
-        if (!is_charging) {
-          if (status_car == 1) {
-            send_can_command(IDLE_CAR_ON); // 0x46 is sent from TCU when car is on
+      if (FAKE_TCU == 1) {
+        // Send idle can message when vcm is awake - fool car that we still have a TCU
+        if (!vcm_is_sleeping()) {
+          if (status_car != 1) { clear_wake_up(); }
+          if (!is_charging) {
+            if (status_car == 1) {
+              send_can_command(IDLE_CAR_ON); // 0x46 is sent from TCU when car is on
+            } else {
+              send_can_command(IDLE); // 0x86 is sent from TCU when car is off
+            } 
           } else {
-            send_can_command(IDLE); // 0x86 is sent from TCU when car is off
-          } 
-        } else {
-            send_can_command(IDLE);
+              send_can_command(IDLE);
+          }
         }
+      }
+
+      // Fix if FAKING TCU...
+      if (!vcm_is_sleeping()) {
+        clear_wake_up();
       }
 
 
       // Timer is enabled, unless car is on
+
       if ( (status_car != 1) && (timer_is_enabled()) ) {
         // check timer data
         if (counter_check_timer > interval_check_timer) { 
-          Serial.printf("Checking timer %d\n",cancounter);     
+          Serial.printf("Checking timer\n");     
           if (!timer_is_active()) {
             previous_loop_timer_active = 0;
           }
@@ -280,8 +299,8 @@ void can_rx_loop() {
               }
             }
           }
-
-          if ((!timer_is_active()) && (is_charging)) {
+          // when cc is on and plugged in, it will show charging
+          if ((!timer_is_active()) && (is_charging) && (!cc_is_on())) {
             charge_complete = 1;
             if (retry_stop_charge_counter < 100) {
               if (retry_stop_charge_counter == 0) { logger("Timer is not active, trying to stop charging."); }
@@ -291,7 +310,6 @@ void can_rx_loop() {
             } else {
               if (retry_stop_charge_counter < 101) {
                 logger("Failed to stop charging when timer is not active, giving up now.");
-                clear_wake_up();
                 retry_stop_charge_counter++;
               }
             }
@@ -342,12 +360,12 @@ void wifi_loop(void* task_time_us) {
   init_webserver();
   while (true) {
     vTaskDelay(2000);
-    if (retry_wlan_counter > 0) {
+    if (counter_retry_wlan > 0) {
       if (!wifi_connected()) {
         if (wlan_connect == 1) {
           connect_wlan();
         }
-        retry_wlan_counter--;
+        counter_retry_wlan--;
       }
     }
   }
@@ -361,8 +379,9 @@ void logging_loop(void* task_time_us) {
   while (true) {
 
     unsigned long currentMillis = millis();
+    long diffMillis = currentMillis - previousMillis;
 
-    if (currentMillis - previousMillis >= 100) {
+    if ((diffMillis >= 10) || (pointer_can_log_buffer > 4096)) {
       previousMillis = currentMillis;
 
       // Logbuffer for webserver
@@ -387,14 +406,23 @@ void logging_loop(void* task_time_us) {
 
       // Logbuffer for canframes (save to sd card)
       if(pointer_can_log_buffer > 0) {
-        //Serial.printf("Before: %d,%d\n",pointer_can_log_buffer,millis());
-        memcpy(temp_buffer,can_log_buffer,pointer_can_log_buffer + 1);
-  //      for (int i = 0; i < pointer_can_log_buffer; i++) {
-  //        temp_buffer[i] = can_log_buffer[i];
-  //      }
+        int old_buffer_rx = can_log_buffer_rx;
+        int old_pointer = pointer_can_log_buffer;
+        if (can_log_buffer_rx == 1) {
+          can_log_buffer_rx = 2;
+        } else {
+          can_log_buffer_rx = 1;
+        }
         pointer_can_log_buffer = 0;
-        if (get_candump_status()) { log2sd(temp_buffer); }
-        //Serial.printf("After: %d,%d\n",pointer_can_log_buffer,millis());
+        if (get_candump_status()) { 
+          if (old_buffer_rx == 1) {
+//            Serial.printf("Old P1a:%d - %d,%d\n",old_pointer,can_log_buffer1[old_pointer-1],can_log_buffer1[old_pointer]);
+            log2sd(can_log_buffer1,old_pointer); 
+          } else {
+//            Serial.printf("Old P1b:%d - %d,%d\n",old_pointer,can_log_buffer2[old_pointer-1],can_log_buffer2[old_pointer]);
+            log2sd(can_log_buffer2,old_pointer); 
+          }   
+        }
       }
     }
     vTaskDelay(1);
@@ -442,11 +470,15 @@ void logger_can(CAN_frame_t frame, FRAME_DIRECTION fdir) {
   sprintf(log_string,"(%s) %s %s#%s\n",time_stamp,direction,temp_string,hexdata);
   if (pointer_can_log_buffer + strlen(log_string) + 20 < LOG_BUFFER_SIZE ) {
     for (int i = 0; i < strlen(log_string) + 1; i++) {
-      can_log_buffer[i + pointer_can_log_buffer] = log_string[i];
+      if (can_log_buffer_rx == 1) {
+        can_log_buffer1[i + pointer_can_log_buffer] = log_string[i];
+      } else {
+        can_log_buffer2[i + pointer_can_log_buffer] = log_string[i];
+      }
     }
     pointer_can_log_buffer += strlen(log_string);  
   } 
-  cancounter++;
+  counter_can++;
 
 //  Serial.println(can_log_buffer);
 //if (get_candump_status()) { 
@@ -461,6 +493,7 @@ void read_preferences() {
 
   preferences.begin("leaf-timer", true);
   timer_enabled = preferences.getUInt("timer_enabled", 0);
+  logger("Timer enabled:" + String(timer_enabled));
   timer_soc = preferences.getUInt("timer_soc", 0);
   size_t l_string = preferences.getString("timer_start", temp_string, sizeof(temp_string));
   if (l_string > 0) { 
@@ -730,11 +763,14 @@ void check_can_bus() {
     if (rx_frame.FIR.B.RTR != CAN_RTR) {
 
       // only dump these frames...
+/*
       if ( (rx_frame.MsgID == 0x1c2) || (rx_frame.MsgID == 0x59e) || (rx_frame.MsgID == 0x1d4) ||
         (rx_frame.MsgID == 0x1db) ||  (rx_frame.MsgID == 0x55b) ||  (rx_frame.MsgID == 0x5bc) ||
         (rx_frame.MsgID == 0x5bf) || (rx_frame.MsgID == 0x7bb) || (rx_frame.MsgID == 0x11a) ) {  
         logger_can(rx_frame,RX_FRAME);
       }
+*/
+      logger_can(rx_frame,RX_FRAME);
 
       if (rx_frame.MsgID == 0x1c2) {  
         battery_type = LEAF_ZE1;
@@ -744,6 +780,14 @@ void check_can_bus() {
       }
       if (rx_frame.MsgID == 0x11a) { // Car status
         // 2 = car off, 1 = car on, 0 = no data
+        int old_button = last_steering_wheel_button;
+        last_steering_wheel_button = rx_frame.data.u8[2];
+        if (last_steering_wheel_button != old_button) {
+          if (LOG_STEERING_WHEEL_BUTTON_CHANGES) {
+            logger("Buton change:" + String(last_steering_wheel_button));
+          }
+        }
+
         int old_status_car = status_car;
         status_car = (rx_frame.data.u8[1] & 0xc0) >> 6;
         // Emulate TCU when car turns on
@@ -751,7 +795,7 @@ void check_can_bus() {
           timestamp_car_went_on = timestamp_now(); 
         }
         if ( (old_status_car == 1) && (status_car != 1)) {
-          retry_wlan_counter = 3;
+          counter_retry_wlan = 3;
         }
 
         timestamp_last_11a_received = timestamp_now();        
@@ -778,6 +822,32 @@ void check_can_bus() {
           send_can_stop_charge();
         }
       }  
+
+      if (rx_frame.MsgID == 0x54a) { // HVAC
+        int TEMP = (rx_frame.data.u8[7]);
+        if (TEMP != 0xff) {
+          cc_inside_temp = (TEMP - 40);
+        }
+        TEMP = (rx_frame.data.u8[4]);
+        if (TEMP != 0x00) {
+          cc_set_temp = (0.5 * TEMP);
+        }
+      }
+
+      if (rx_frame.MsgID == 0x54c) { // HVAC
+        int TEMP = (rx_frame.data.u8[6]);
+        if (TEMP != 0xff) {
+          cc_outside_temp = (0.5 * TEMP - 40);
+        }
+      }
+
+      if (rx_frame.MsgID == 0x54b) { // HVAC
+        cc_status = rx_frame.data.u8[1];
+        cc_fan_target = rx_frame.data.u8[2];
+        cc_fan_intake = rx_frame.data.u8[3];
+        Serial.printf("intake:%f\n",cc_fan_intake);
+        cc_fanspeed = (rx_frame.data.u8[4] & 0x38) >> 3;
+      }
 
       if (rx_frame.MsgID == 0x55b) { // HVBAT, soc etc
         int LB_TEMP = (rx_frame.data.u8[0] << 2 | rx_frame.data.u8[1] >> 6);
@@ -936,7 +1006,7 @@ void can_tx_loop() {
         tx_frame.data.u8[i] = new1db[i];
         old_can_1db[i] = new1db[i];
       }
-      num_frames_to_send = 8;
+      num_frames_to_send = 4;
       interval_frame = 1;
       logger("Sending stop_charge frames");
       should_send_stop_charge = 0;
@@ -1090,7 +1160,16 @@ void init_webserver() {
     request->send_P(200, "text/html", div_overview_html, processor);
   });
 
+  server.on("/climate", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", climate_html, processor);
+  });
+
+  server.on("/div_climate", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", div_climate_html, processor);
+  });
+
   server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* request) {
+    html_message = "";
     request->send_P(200, "text/html", wifi_html, processor);
   });
 
@@ -1121,10 +1200,12 @@ void init_webserver() {
 
 
   server.on("/timer", HTTP_GET, [](AsyncWebServerRequest* request) {
+    html_message = "";
     request->send_P(200, "text/html", timer_html, processor);
   });
 
   server.on("/clock", HTTP_GET, [](AsyncWebServerRequest* request) {
+    html_message = "";
     request->send_P(200, "text/html", clock_html, processor);
   });
 
@@ -1162,30 +1243,21 @@ void init_webserver() {
   });
 
   server.on("/wake_up", HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (!timer_is_enabled()) {
-      bool changed = set_wake_up();
-      if (changed) {
-        html_message = "Tried to wake up VCM in car!";
-      } else {
-        html_message = "No need to wake up VCM in car, bit already set!";
-      }
-
+    bool changed = set_wake_up();
+    if (changed) {
+      html_message = "Tried to wake up VCM in car!";
     } else {
-      html_message = "Refuse to start when timer is enabled!";
+      html_message = "No need to wake up VCM in car, bit already set!";
     }
     request->send_P(200, "text/html", control_html, processor);
   });
 
   server.on("/sleep", HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (!timer_is_enabled()) {
-      if (state_wake_up_pin == 1) {
-        clear_wake_up();
-        html_message = "VCM wake-up pin has now been cleared.";
-      } else {
-        html_message = "VCM wake-up pin is already zero!";
-      }
+    if (state_wake_up_pin == 1) {
+      clear_wake_up();
+      html_message = "VCM wake-up pin has now been cleared.";
     } else {
-      html_message = "Refuse to start when timer is enabled!";
+      html_message = "VCM wake-up pin is already zero!";
     }
     request->send_P(200, "text/html", control_html, processor);
   });
@@ -1230,25 +1302,31 @@ void init_webserver() {
   });
 
   server.on("/log", HTTP_GET, [](AsyncWebServerRequest* request) {
+    candump = -1;
     if (request->hasParam("candump")) {
       candump = string2long(request->getParam("candump")->value());
       if (candump == 1) {
         resume_can_writing();
         logger("start candump");
+        counter_can = 0;
       } 
       if (candump == 0) {
         pause_can_writing();
-        logger("stop candump");
+        logger("stop candump, got:" + String(counter_can) + " frames");
       }
       if (candump == 2) {
         delete_can_log();
         logger("delete candump file");
       }
+      if (candump == 3) {
+        request->send(SD, CAN_LOG_FILE, String(), true);
+        logger("Downloading file");
+      }
     }
-    vTaskDelay(100);
-    log_semaphore = 1;
-    request->send_P(200, "text/html", log_html, processor);
-    log_semaphore = 0;
+    if (candump != 3) {
+      vTaskDelay(100);
+      request->send_P(200, "text/html", log_html, processor);
+    }
   });
 
   server.onNotFound(notFound);
@@ -1256,11 +1334,88 @@ void init_webserver() {
   server.begin();
 }
 
+bool cc_is_on() {
+  if ((cc_status == 0x76) || (cc_status == 0x78)) {
+    return true;
+  }
+  return false;
+}
+
+String get_string_for_cc_status(int cc_status) {
+  String s = "";
+  switch (cc_status) {
+  case 0x08:
+    s = "off";
+    break;
+  case 0x76:
+    s = "auto";
+    break;
+  case 0x78:
+    s = "manual";
+    break;
+  default:
+    s = "unknown";
+    break;
+  }
+  return s;
+}
+
+
+String get_string_for_cc_fan_target(int cc_fan_target) {
+  String s = "";
+
+  switch (cc_fan_target)  {
+  case 0x80:
+    s = "off";
+    break;
+  case 0x88:
+    s = "face";
+    break;
+  case 0x90:
+    s = "face & feet";
+    break;
+  case 0x98:
+    s = "feet";
+    break;
+  case 0xA0:
+    s = "windshield & feet";
+    break;
+  case 0xA8:
+    s = "windshield";
+    break;
+  default:
+    s = "unknown";
+    break;
+  }
+  return s;
+}
+
+
+String get_string_for_cc_fan_intake(int cc_fan_intake) {
+  String s = "";
+
+  switch (cc_fan_intake)  {
+  case 0x09:
+    s = "recirculate";
+    break;
+  case 0x12:
+    s = "fresh air";
+    break;
+  case 0x92:
+    s = "defrost";
+    break;
+  default:
+    s = "unknown";
+    break;
+  }
+  return s;
+}
+
 
 String processor(const String& var)
 {
   if(var == "LINKS") {
-    String content = "<a href='/' class='button'>Overview</a>&nbsp;<a href='/timer' class='button'>Set timer</a>&nbsp;<a href='/clock' class='button'>Set clock</a>&nbsp;<a href='/control' class='button'>Manual Control</a>&nbsp;<a href='/wifi' class='button'>Wifi</a>&nbsp;<a href='/log' class='button'>Log</a><br><hr>";
+    String content = "<a href='/' class='button'>Overview</a>&nbsp;<a href='/timer' class='button'>Set timer</a>&nbsp;<a href='/clock' class='button'>Set clock</a>&nbsp;<a href='/climate' class='button'>Climate info</a>&nbsp;<a href='/control' class='button'>Manual Control</a>&nbsp;<a href='/wifi' class='button'>Wifi</a>&nbsp;<a href='/log' class='button'>Log</a><br><hr>";
     return content;
   }
 
@@ -1269,6 +1424,25 @@ String processor(const String& var)
 //    if (timestamp_last_soc_received <= 0) {
 //      content = "style='display: none;'";
 //    }
+    return content;
+  } 
+
+  if(var == "CLIMATE") {
+    String content = "";
+    content += "Temp outside: " + String(cc_outside_temp) + "<br><br>";
+    content += "Temp inside: " + String(cc_inside_temp) + "<br><br>";
+    String str_cc_status = "";
+    str_cc_status = get_string_for_cc_status(cc_status);
+    content += "CC status: " + str_cc_status + "<br><br>";
+    content += "CC temp set: " + String(cc_set_temp) + "<br><br>";
+    content += "Fan speed: " + String(cc_fanspeed) + "<br><br>";
+    String str_cc_fan_target = "";
+    str_cc_fan_target = get_string_for_cc_fan_target(cc_fan_target);
+    content += "Fan target: " + str_cc_fan_target + "<br><br>";
+    String str_cc_fan_intake = "";
+    str_cc_fan_intake = get_string_for_cc_fan_intake(cc_fan_intake);
+    content += "Fan intake: " + str_cc_fan_intake + "<br><br>";
+
     return content;
   } 
 
@@ -1369,7 +1543,7 @@ String processor(const String& var)
   if(var == "CHARGE_TIME") {
     String content = "";
     String status = "";
-    float capacity_left_to_soc = 0.01 * battery_capacity_new * status_soh * (timer_soc - status_soc);
+    float capacity_left_to_soc = 0.01 * BATTERY_CAPACITY_NEW * status_soh * (timer_soc - status_soc);
     float c = std::trunc(capacity_left_to_soc / 1000) / 100.0;
     float time_left_hours = c/2;
     float time_left = std::trunc(time_left_hours * 100) / 100.0;

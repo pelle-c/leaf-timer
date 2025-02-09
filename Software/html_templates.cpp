@@ -98,7 +98,8 @@ Connect to WLAN: <select name="wlan_connect">
 WLAN is %WLAN_STATUS%<br><br>
 WLAN SSID:<input type='text' id='wlan_ssid' name='wlan_ssid' value='%WLAN_SSID%'><br><br>
 WLAN Password:<input type='password' id='wlan_password' name='wlan_password' value='%WLAN_PASSWORD%'><br><br>
-<br><input type="submit" value="Save" />
+<br><input type="submit" value="Save" /><br><br>
+Note: You may need to reset after configuration changes.
 </form>
 <div>
 <br><br>
@@ -275,7 +276,7 @@ a.button {
 <body>
 <h1>Leaf timer - Log</h1>
 %LINKS%<br>
-<a href='/log?candump=1' class='button'>Start candump to SD</a>&nbsp<a href='log?candump=0' class='button'>Stop candump to SD</a>&nbsp<a href='log?candump=2' class='button'>Delete candump file</a><br><br>
+<a href='/log?candump=1' class='button'>Start candump to SD</a>&nbsp<a href='log?candump=0' class='button'>Stop candump to SD</a>&nbsp<a href='log?candump=2' class='button'>Delete candump</a>&nbsp<a href='log?candump=3' class='button'>Download candump</a><br><br>
 %CANDUMP%, %SD_CARD%
 <br>
 <br>
@@ -284,3 +285,67 @@ a.button {
 </div>
 </body>
 )rawliteral";
+
+const char climate_html[] = R"rawliteral(
+<!doctypehtml><title>Leaf Timer</title>
+<script type="text/javascript">
+function xmlhttpGet(strURL) {
+    var xmlHttpReq = false;
+    var self = this;
+    // Mozilla/Safari
+    if (window.XMLHttpRequest) {
+        self.xmlHttpReq = new XMLHttpRequest();
+    }
+    // IE
+    else if (window.ActiveXObject) {
+        self.xmlHttpReq = new ActiveXObject("Microsoft.XMLHTTP");
+    }
+
+    self.xmlHttpReq.overrideMimeType('Content-Type', 'text/html');
+    self.xmlHttpReq.open('GET', strURL, true);
+    self.xmlHttpReq.send();
+
+    self.xmlHttpReq.onreadystatechange = function() {
+        if (self.xmlHttpReq.readyState == 4) {
+            update_div(self.xmlHttpReq.responseText);
+        }
+    }
+}
+function update_div(str){
+  document.getElementById("div_climate").innerHTML=str;
+}
+
+function doLoop1()
+{
+  xmlhttpGet('div_climate');
+  setTimeout(doLoop1,1000);
+}
+
+function load()
+{
+  doLoop1();
+}
+</script>
+<meta content="width=device-width"name=viewport><style>html{font-family:Arial;display:inline-block;text-align:center}h2{font-size:3rem}body{max-width:800px;margin:0 auto}
+a.button {
+    padding: 1px 6px;
+    border: 1px outset buttonborder;
+    border-radius: 3px;
+    color: buttontext;
+    background-color: buttonface;
+    text-decoration: none;
+}</style>
+<body onload="load()">
+<h1>Leaf climate</h1>
+%LINKS%<br>
+<div id="div_climate">
+</div>
+</body>
+)rawliteral";
+
+const char div_climate_html[] = R"rawliteral(
+%CLIMATE%
+)rawliteral";
+
+
+

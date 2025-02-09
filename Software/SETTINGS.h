@@ -16,4 +16,7 @@
 #define SD_SCLK_PIN 14
 #define SD_CS_PIN 13
 
-#define battery_capacity_new 40000
+#define FAKE_TCU 0
+#define BATTERY_CAPACITY_NEW 40000
+
+#define LOG_STEERING_WHEEL_BUTTON_CHANGES 1

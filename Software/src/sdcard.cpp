@@ -1,5 +1,5 @@
 #include "sdcard.h"
-#include "freertos/ringbuf.h"
+//#include "freertos/ringbuf.h"
 
 #if defined(SD_CS_PIN) && defined(SD_SCLK_PIN) && defined(SD_MOSI_PIN) && \
     defined(SD_MISO_PIN)  // ensure code is only compiled if all SD card pins are defined
@@ -74,11 +74,14 @@ bool get_candump_status() {
   return true;
 }
 
-void log2sd(String s) {
-//  char log_string[4096];
-//  sprintf(log_string,"%s",s);
-  can_log_file.print(s);
-  //Serial.printf("%s",log_string);
+void log2sd(String s,int l) {
+//  Serial.printf("Old P2:%d - %d,%d\n",l,s[l-1],s[l]);
+//  Serial.println(s);
+  int ret = can_log_file.print(s);
+  if (ret < l) {
+    Serial.println(ret);
+  }
+  //Serial.printf("Writing %d bytes\n",l);
 }
 
 

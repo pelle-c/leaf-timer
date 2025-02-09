@@ -14,7 +14,7 @@ long get_file_size();
 bool get_candump_file_status();
 bool get_sdcard_status();
 bool get_candump_status();
-void log2sd(String s); 
+void log2sd(String s,int l); 
 void init_logging_buffer();
 
 void init_sdcard();
