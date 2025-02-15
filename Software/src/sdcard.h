@@ -7,8 +7,8 @@
 #include <ESP32CAN.h>
 
 #if defined(SD_CS_PIN) && defined(SD_SCLK_PIN) && defined(SD_MOSI_PIN) && \
-    defined(SD_MISO_PIN)  // ensure code is only compiled if all SD card pins are defined
-#define CAN_LOG_FILE "/canlog.txt"
+    defined(SD_MISO_PIN)  
+#define CADUMP_FILE "/canlog.txt"
 
 long get_file_size();
 bool get_candump_file_status();
@@ -18,11 +18,11 @@ void log2sd(String s,int l);
 void init_logging_buffer();
 
 void init_sdcard();
-void print_sdcard_details();
+void print_sdcard_details_on_serial();
 
-void pause_can_writing();
-void resume_can_writing();
-void delete_can_log();
-#endif  // defined(SD_CS_PIN) && defined(SD_SCLK_PIN) && defined(SD_MOSI_PIN) && defined(SD_MISO_PIN)
+void stop_candump();
+void start_candump();
+void delete_candump_file();
+#endif  
 
-#endif  // SDCARD_H
+#endif 

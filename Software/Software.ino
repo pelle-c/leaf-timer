@@ -14,6 +14,19 @@
 #include "Preferences.h"
 #include "src/sdcard.h"
 
+#include "Wire.h"
+#include "ADS1X15.h"
+//  choose your sensor
+//  ADS1013 ADS(0x48);
+//  ADS1014 ADS(0x48);
+ADS1015 ADS(0x48);
+//  ADS1113 ADS(0x48);
+//  ADS1114 ADS(0x48);
+//  ADS1115 ADS(0x48);
+
+// Pins for AD converter
+#define I2C_SDA 18
+#define I2C_SCL 5
 
 #define CONFIG_ASYNC_TCP_MAX_ACK_TIME=5000   // (keep default)
 #define CONFIG_ASYNC_TCP_PRIORITY=10         // (keep default)
@@ -129,6 +142,10 @@ TaskHandle_t th_logging_loop_task;
 #define CORE_LOGGING 0
 #define TASK_LOGGING_PRIO 8
 
+TaskHandle_t th_adc_loop_task;
+#define CORE_ADC 0
+#define TASK_ADC_PRIO 6
+
 TaskHandle_t th_can_rx_loop_task;
 #define CORE_MAIN 1
 #define TASK_CANRX_PRIO 6
@@ -161,6 +178,8 @@ void setup() {
 void createCoreTasks() {
   xTaskCreatePinnedToCore(wifi_loop, "wifi_loop", 4096, NULL,
                           TASK_WIFI_PRIO, &th_wifi_loop_task, CORE_WIFI);
+  xTaskCreatePinnedToCore(adc_loop, "adc_loop", 4096, NULL,
+                          TASK_ADC_PRIO, &th_adc_loop_task, CORE_ADC);
   xTaskCreatePinnedToCore(logging_loop, "logging_loop", 4096, NULL,
                           TASK_LOGGING_PRIO, &th_logging_loop_task, CORE_LOGGING);
   xTaskCreatePinnedToCore((TaskFunction_t)&can_rx_loop, "can_rx_loop", 4096, NULL,
@@ -174,6 +193,7 @@ void shutdown_tasks() {
    vTaskDelete( th_can_tx_loop_task );
    vTaskDelete( th_logging_loop_task );
    vTaskDelete( th_wifi_loop_task );
+   vTaskDelete( th_adc_loop_task );
 }
 
 
@@ -371,6 +391,31 @@ void wifi_loop(void* task_time_us) {
   }
 }
 
+void adc_loop(void* task_time_us) {
+
+  Serial.printf("Init AD converter\n");     
+  Wire.begin(I2C_SDA, I2C_SCL);
+  ADS.begin();
+  ADS.setGain(0);
+
+  while (true) {
+    vTaskDelay(100);
+
+    int16_t val_0 = ADS.readADC(0);  
+    int16_t val_1 = ADS.readADC(1);  
+    int16_t val_2 = ADS.readADC(2);  
+    int16_t val_3 = ADS.readADC(3);  
+
+    float f = ADS.toVoltage(1);  //  voltage factor
+
+    Serial.print("\tAnalog0: "); Serial.print(val_0); Serial.print('\t'); Serial.println(val_0 * f, 3);
+    Serial.print("\tAnalog1: "); Serial.print(val_1); Serial.print('\t'); Serial.println(val_1 * f, 3);
+    Serial.print("\tAnalog2: "); Serial.print(val_2); Serial.print('\t'); Serial.println(val_2 * f, 3);
+    Serial.print("\tAnalog3: "); Serial.print(val_3); Serial.print('\t'); Serial.println(val_3 * f, 3);
+    Serial.println();
+  }
+}
+
 
 void logging_loop(void* task_time_us) {
   unsigned long timestamp_prev_clear = 0;
@@ -381,7 +426,7 @@ void logging_loop(void* task_time_us) {
     unsigned long currentMillis = millis();
     long diffMillis = currentMillis - previousMillis;
 
-    if ((diffMillis >= 10) || (pointer_can_log_buffer > 4096)) {
+    if ((diffMillis >= 100) || (pointer_can_log_buffer > 4096)) {
       previousMillis = currentMillis;
 
       // Logbuffer for webserver
@@ -413,13 +458,15 @@ void logging_loop(void* task_time_us) {
         } else {
           can_log_buffer_rx = 1;
         }
+        can_log_buffer1[old_pointer] = 0;
+        can_log_buffer2[old_pointer] = 0;
         pointer_can_log_buffer = 0;
         if (get_candump_status()) { 
           if (old_buffer_rx == 1) {
-//            Serial.printf("Old P1a:%d - %d,%d\n",old_pointer,can_log_buffer1[old_pointer-1],can_log_buffer1[old_pointer]);
+            //Serial.printf("Old P1a:%d - %d,%d\n",old_pointer,can_log_buffer1[old_pointer-1],can_log_buffer1[old_pointer]);
             log2sd(can_log_buffer1,old_pointer); 
           } else {
-//            Serial.printf("Old P1b:%d - %d,%d\n",old_pointer,can_log_buffer2[old_pointer-1],can_log_buffer2[old_pointer]);
+            //.printf("Old P1b:%d - %d,%d\n",old_pointer,can_log_buffer2[old_pointer-1],can_log_buffer2[old_pointer]);
             log2sd(can_log_buffer2,old_pointer); 
           }   
         }
@@ -780,14 +827,14 @@ void check_can_bus() {
       }
       if (rx_frame.MsgID == 0x11a) { // Car status
         // 2 = car off, 1 = car on, 0 = no data
-        int old_button = last_steering_wheel_button;
+/*        int old_button = last_steering_wheel_button;
         last_steering_wheel_button = rx_frame.data.u8[2];
         if (last_steering_wheel_button != old_button) {
           if (LOG_STEERING_WHEEL_BUTTON_CHANGES) {
             logger("Buton change:" + String(last_steering_wheel_button));
           }
         }
-
+*/
         int old_status_car = status_car;
         status_car = (rx_frame.data.u8[1] & 0xc0) >> 6;
         // Emulate TCU when car turns on
@@ -845,8 +892,8 @@ void check_can_bus() {
         cc_status = rx_frame.data.u8[1];
         cc_fan_target = rx_frame.data.u8[2];
         cc_fan_intake = rx_frame.data.u8[3];
-        Serial.printf("intake:%f\n",cc_fan_intake);
         cc_fanspeed = (rx_frame.data.u8[4] & 0x38) >> 3;
+        // Serial.printf("cc_status:%d\n",cc_status);
       }
 
       if (rx_frame.MsgID == 0x55b) { // HVBAT, soc etc
@@ -1306,20 +1353,20 @@ void init_webserver() {
     if (request->hasParam("candump")) {
       candump = string2long(request->getParam("candump")->value());
       if (candump == 1) {
-        resume_can_writing();
+        start_candump();
         logger("start candump");
         counter_can = 0;
       } 
       if (candump == 0) {
-        pause_can_writing();
+        stop_candump();
         logger("stop candump, got:" + String(counter_can) + " frames");
       }
       if (candump == 2) {
-        delete_can_log();
+        delete_candump_file();
         logger("delete candump file");
       }
       if (candump == 3) {
-        request->send(SD, CAN_LOG_FILE, String(), true);
+        request->send(SD, CADUMP_FILE, String(), true);
         logger("Downloading file");
       }
     }
@@ -1335,7 +1382,7 @@ void init_webserver() {
 }
 
 bool cc_is_on() {
-  if ((cc_status == 0x76) || (cc_status == 0x78)) {
+  if ( (cc_status == 0x76) || (cc_status == 0x78) || (cc_status == 0x0a) ) {
     return true;
   }
   return false;
@@ -1346,6 +1393,9 @@ String get_string_for_cc_status(int cc_status) {
   switch (cc_status) {
   case 0x08:
     s = "off";
+    break;
+  case 0x0a:
+    s = "remote on";
     break;
   case 0x76:
     s = "auto";
@@ -1403,6 +1453,9 @@ String get_string_for_cc_fan_intake(int cc_fan_intake) {
     break;
   case 0x92:
     s = "defrost";
+    break;
+  case 0x00:
+    s = "off";
     break;
   default:
     s = "unknown";
