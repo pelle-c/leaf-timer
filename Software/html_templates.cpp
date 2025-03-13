@@ -347,5 +347,63 @@ const char div_climate_html[] = R"rawliteral(
 %CLIMATE%
 )rawliteral";
 
+const char carinfo_html[] = R"rawliteral(
+<!doctypehtml><title>Leaf Timer</title>
+<script type="text/javascript">
+function xmlhttpGet(strURL) {
+    var xmlHttpReq = false;
+    var self = this;
+    // Mozilla/Safari
+    if (window.XMLHttpRequest) {
+        self.xmlHttpReq = new XMLHttpRequest();
+    }
+    // IE
+    else if (window.ActiveXObject) {
+        self.xmlHttpReq = new ActiveXObject("Microsoft.XMLHTTP");
+    }
 
+    self.xmlHttpReq.overrideMimeType('Content-Type', 'text/html');
+    self.xmlHttpReq.open('GET', strURL, true);
+    self.xmlHttpReq.send();
 
+    self.xmlHttpReq.onreadystatechange = function() {
+        if (self.xmlHttpReq.readyState == 4) {
+            update_div(self.xmlHttpReq.responseText);
+        }
+    }
+}
+function update_div(str){
+  document.getElementById("div_carinfo").innerHTML=str;
+}
+
+function doLoop1()
+{
+  xmlhttpGet('div_carinfo');
+  setTimeout(doLoop1,1000);
+}
+
+function load()
+{
+  doLoop1();
+}
+</script>
+<meta content="width=device-width"name=viewport><style>html{font-family:Arial;display:inline-block;text-align:center}h2{font-size:3rem}body{max-width:800px;margin:0 auto}
+a.button {
+    padding: 1px 6px;
+    border: 1px outset buttonborder;
+    border-radius: 3px;
+    color: buttontext;
+    background-color: buttonface;
+    text-decoration: none;
+}</style>
+<body onload="load()">
+<h1>Leaf car info</h1>
+%LINKS%<br>
+<div id="div_carinfo">
+</div>
+</body>
+)rawliteral";
+
+const char div_carinfo_html[] = R"rawliteral(
+%CARINFO%
+)rawliteral";

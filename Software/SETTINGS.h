@@ -16,6 +16,20 @@
 #define SD_SCLK_PIN 14
 #define SD_CS_PIN 13
 
+// If ADC is used
+#define I2C_SDA 18
+#define I2C_SCL 5
+
+
+#define CAN_SE_PIN 23
+#define LED_PIN 4
+
+
+#define WAKE_UP_PIN 32
+#define REVERSE_PIN 18
+#define HEADUNIT_TX_PIN 5
+#define HEADUNIT_RX_PIN 25
+
 #define FAKE_TCU 0
 #define BATTERY_CAPACITY_NEW 40000
 

@@ -1,0 +1,169 @@
+CC off +4 degrees outside
+
+(1739001470.286) RX 54A#100070020000002D  - 2D=45 ambient_temp_ac, 32|8 ClimateControlSetpoint=0
+(1739001470.287) RX 54B#0108801204000000  - 01(|11) -> CC off, 08?, 80=ClimateVentModeTarget, 12=ClimateVentModeIntake, 4=FANSPEED
+(1739001470.288) RX 54C#6C66000000005A00  - 01101100 01100110 ....5A 00 5A=90 90*0.5=45 45-40 = 5 grader .... 00 5A 00 (fan_voltage, outside_temp, xx)
+(1739001470.289) RX 54F#2201000007008A24  - h22=34 34*0.5=17 17-14 = 3 grader inside_temp   h01=power_cons
+
+
+CC on 19 degrees
+
+(1739001560.215) RX 54A#9E0070062600002D  - 2D=45 ambient_temp_ac, 32|8 ClimateControlSetpoint=h26 (38*0.5=19)!!!!
+(1739001560.216) RX 54B#007698120C000000  - 00(|10) -> CC on, 76?, 98=ClimateVentModeTarget, 12=ClimateVentModeIntake, C=FANSPEED
+(1739001560.217) RX 54C#6C66400000385A00  - 6C=ACEvaporatorTemperature,01101100 01100110 ....5A 00 5A=90 90*0.5=45 45-40 = 5 grader .... 38 5A 00 (fan_voltage, outside_temp, xx)
+(1739001560.218) RX 54F#2201000007408A24  - h22=34 34*0.5=17 17-14 = 3 grader inside_temp   h01=power_cons.....74 - 4=counter
+
+
+(1739001613.776) RX 54A#100070062C00002D
+
+
+00-30-38-40-70-78-80-88-90-98-a0 fan fan_voltage
+
+04-0c (auto)
+24-2c-34-3c manuell
+
+
+
+
+54a: float setpoint_float = d[4] / 2;
+54b: int fanspeed_int = ((d[4] & 0x38) >> 3); //use bits 5:3 to read fan speed
+      switch (d[2])
+      {
+      case 0x80:
+        m_climate_vent->SetValue("off");
+        break;
+      case 0x88:
+        m_climate_vent->SetValue("face");
+        break;
+      case 0x90:
+        m_climate_vent->SetValue("face|feet");
+        break;
+      case 0x98:
+        m_climate_vent->SetValue("feet");
+        break;
+      case 0xA0:
+        m_climate_vent->SetValue("windscreen|feet");
+        break;
+      case 0xA8:
+        m_climate_vent->SetValue("windscreen");
+        break;
+
+      default:
+        m_climate_vent->SetValue("");
+        break;
+      }
+
+      switch (d[3])
+      {
+      case 0x09:
+        m_climate_intake->SetValue("recirc");
+        break;
+      case 0x12:
+        m_climate_intake->SetValue("fresh");
+        break;
+      case 0x92:
+        m_climate_intake->SetValue("defrost");
+        break;
+
+      default:
+        m_climate_intake->SetValue("");
+        break;
+      }
+
+
+        hvac_calculated =
+          d[1] == 0x0a || // Gen 1 Remote
+          d[1] == 0x48 || // Manual Heating or Fan Only
+          d[1] == 0x4b || // Gen 2 Remote Heating
+          d[1] == 0x71 || // Gen 2 Remote Cooling
+          d[1] == 0x76 || // Auto
+          d[1] == 0x78;   // Manual A/C on
+
+(1739018529.764) RX 54B#0108800904000000 - off
+(1739018119.287) RX 54B#007698120C000001 - auto on
+(1739018269.483) RX 54B#007898120C000001 - manual
+
+
+fan:
+
+04 = 00 000 100 - 0 off
+0c = 00 001 100 - 1
+14 = 00 010 100 - 2
+1c = 00 011 100 - 3
+24 = 00 100 100 - 4
+2c = 00 101 100 - 5
+34 = 00 110 100 - 6
+3c = 00 111 100 - 7
+
+manual:
+(1739018395.179) RX 54B#0078981224000001
+(1739001973.515) RX 54B#0076981224000000
+
+acc auto/manual:
+ej 54A,54B
+
+(1739001973.513) RX 54A#100070062600002D 
+(1739018419.800) RX 54A#9E0070072600002C       
+
+(1739001973.515) RX 54B#0076981224000000 - Auto
+(1739018419.801) RX 54B#0078981224000001
+(1739001973.515) RX 54C#6C66400000705B00 - Auto
+(1739018419.801) RX 54C#7366400000705800
+(1739001973.516) RX 54F#2501000007878A5A - Auto
+(1739018419.801) RX 54F#2A01000007CD8A5F
+
+
+(1739018529.763) RX 54A#9E0070020000002C - cc off-recirc/fan0
+(1739018505.463) RX 54A#100070030000002C - cc off-fresh
+(1739018119.088) RX 54A#100070072600002C - cc on - auto fan1/fan2/fan3
+(1739018268.683) RX 54A#100070072600002C - cc manual fan1
+(1739018359.831) RX 54A#9E0070072600002C - cc manual fan2
+(1739018359.934) RX 54A#100070062600002C - cc manual fan3
+(1739018391.177) RX 54A#9E0070072600002C - cc manual fan3
+6->7 or 7->6 indicates change
+
+(1739018529.765) RX 54C#7666000000005800 - cc off-recirc
+(1739018503.872) RX 54C#7666000000005800 - cc off-fresh
+(1739018116.806) RX 54C#6B66000000005800 - cc off-fresh
+(1739018119.288) RX 54C#6B66400000305800 - cc on - auto fan 1
+(1739018182.837) RX 54C#6C66400000505800 - cc on - auto fan 2
+(1739018210.658) RX 54C#6C66400000585800 - cc on - auto fan 3
+(1739001973.515) RX 54C#6C66400000705B00 - cc on - auto fan 4
+(1739018357.832) RX 54C#7066400000505800 - cc manual fan2
+(1739018366.438) RX 54C#7066400000605800 - cc manual fan3
+(1739018390.057) RX 54C#7166400000605800 - cc manual fan3
+(1739018391.878) RX 54C#7166400000705800 - cc manual fan4
+
+(1739018529.766) RX 54F#2A010000074 08A60 - cc off-recirc
+(1739018504.065) RX 54F#2B010000070 08A57 - cc off-fresh
+(1739018505.466) RX 54F#2B010000078 08A57 - cc off-fresh
+(1739018126.595) RX 54F#21010000074 18A2C - cc on - auto fan 1
+(1739018117.207) RX 54F#2101000007C 48A2D - cc on - auto fan 1
+(1739018118.009) RX 54F#2101000007C 38A2D - cc on - auto fan 1
+(1739018118.009) RX 54F#21010000074 28A2D - cc on - auto fan 1
+(1739018118.009) RX 54F#21010000070 18A2C - cc on - auto fan 1
+(1739018182.838) RX 54F#2201000007C F8A39 - cc on - auto fan 2
+(1739001973.516) RX 54F#25010000078 78A5A - cc on - auto fan 4
+
+(1739018327.729) RX 54F#24010000078 D8A5A - cc manual fan1
+(1739018327.930) RX 54F#24010000070 D8A5A - cc manual fan1
+(1739018334.615) RX 54F#2501000007C D8A5B - cc manual fan2
+(1739018465.295) RX 54F#3101000007C F8A5F - cc manual fan6
+(1739018470.679) RX 54F#32010000074 F8A5F - cc manual fan7
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

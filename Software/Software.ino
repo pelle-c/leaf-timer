@@ -13,20 +13,21 @@
 #include "SETTINGS.h"
 #include "Preferences.h"
 #include "src/sdcard.h"
+//#include <HardwareSerial.h>
 
-#include "Wire.h"
-#include "ADS1X15.h"
+// #include "Wire.h"
+// #include "ADS1X15.h"
 //  choose your sensor
 //  ADS1013 ADS(0x48);
 //  ADS1014 ADS(0x48);
-ADS1015 ADS(0x48);
+//ADS1015 ADS(0x48);
 //  ADS1113 ADS(0x48);
 //  ADS1114 ADS(0x48);
 //  ADS1115 ADS(0x48);
 
 // Pins for AD converter
-#define I2C_SDA 18
-#define I2C_SCL 5
+// #define I2C_SDA 18
+// #define I2C_SCL 5
 
 #define CONFIG_ASYNC_TCP_MAX_ACK_TIME=5000   // (keep default)
 #define CONFIG_ASYNC_TCP_PRIORITY=10         // (keep default)
@@ -58,10 +59,6 @@ const int interval_bat = 100;        // n * interval_base at which interval to s
 const int rx_queue_size = 10;       // Receive Queue size
 const int interval_check_timer = 10;// n * interval_base at which interval to check the timer
 
-#define CAN_SE_PIN 23
-#define WAKE_UP_PIN 25
-
-#define LED_PIN 4
 #define PIXEL 0
 #define NUMPIXELS 1
 Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -98,14 +95,25 @@ String html_message = "";
 int timer_soc = 80;
 int soc_hysteresis = 0;
 
-int last_steering_wheel_button = 0;
+int gear = 0;
+int old_gear = 0;
 float cc_outside_temp = 0;
 float cc_inside_temp = 0;
 float cc_set_temp = 0;
-int cc_status = 0;
-int cc_fanspeed = 0;
+float old_cc_outside_temp = 0;
+float old_cc_inside_temp = 0;
+float old_cc_set_temp = 0;
+int cc_fan_status = 0;
+int cc_fan_speed = 0;
 int cc_fan_target = 0;
 int cc_fan_intake = 0;
+int cc_rear_defrost = 0;
+int old_cc_fan_status = 0;
+int old_cc_fan_speed = 0;
+int old_cc_fan_target = 0;
+int old_cc_fan_intake = 0;
+int old_cc_rear_defrost = 0;
+
 long timestamp_last_soc_received = -600;  // Timestamp when can message with soc was rec
 long timestamp_last_11a_received = -600;  // Timestamp when can message with 11a was rec
 long timestamp_last_1d4_received = -600;  // Timestamp when can message with 1d4 was rec
@@ -142,9 +150,9 @@ TaskHandle_t th_logging_loop_task;
 #define CORE_LOGGING 0
 #define TASK_LOGGING_PRIO 8
 
-TaskHandle_t th_adc_loop_task;
-#define CORE_ADC 0
-#define TASK_ADC_PRIO 6
+TaskHandle_t th_serial_loop_task;
+#define CORE_SERIAL 0
+#define TASK_SERIAL_PRIO 6
 
 TaskHandle_t th_can_rx_loop_task;
 #define CORE_MAIN 1
@@ -153,10 +161,6 @@ TaskHandle_t th_can_rx_loop_task;
 TaskHandle_t th_can_tx_loop_task;
 #define CORE_MAIN 1
 #define TASK_CANTX_PRIO 4
-
-//#define TASK_CORE_PRIO 4
-//#define TASK_MODBUS_PRIO 8
-
 
 void setup() {
   read_preferences();
@@ -167,19 +171,35 @@ void setup() {
   Serial.println("Starting Leaf timer");
   Serial.println("Configuring access point...");
   pinMode(WAKE_UP_PIN, OUTPUT);  
+  pinMode(REVERSE_PIN, OUTPUT);  
+  digitalWrite(REVERSE_PIN,0);
   state_wake_up_pin = 0;
   digitalWrite(WAKE_UP_PIN,state_wake_up_pin);
+//  test_blink_pin(HEADUNIT_TX_PIN);
   show_led_wakeup_pin(0);
   init_can();
   createCoreTasks();
-  init_sdcard();
+  init_sdcard();  
 }
+
+
+void test_blink_pin(int pin) {
+  pixels.begin();
+  pinMode(pin, OUTPUT);  
+  while (1) {
+    digitalWrite(pin,0);
+    vTaskDelay(100);
+    digitalWrite(pin,1);
+    vTaskDelay(100);
+  }
+}
+
 
 void createCoreTasks() {
   xTaskCreatePinnedToCore(wifi_loop, "wifi_loop", 4096, NULL,
                           TASK_WIFI_PRIO, &th_wifi_loop_task, CORE_WIFI);
-  xTaskCreatePinnedToCore(adc_loop, "adc_loop", 4096, NULL,
-                          TASK_ADC_PRIO, &th_adc_loop_task, CORE_ADC);
+  xTaskCreatePinnedToCore(serial_loop, "serial_loop", 4096, NULL,
+                          TASK_SERIAL_PRIO, &th_serial_loop_task, CORE_SERIAL);
   xTaskCreatePinnedToCore(logging_loop, "logging_loop", 4096, NULL,
                           TASK_LOGGING_PRIO, &th_logging_loop_task, CORE_LOGGING);
   xTaskCreatePinnedToCore((TaskFunction_t)&can_rx_loop, "can_rx_loop", 4096, NULL,
@@ -193,7 +213,7 @@ void shutdown_tasks() {
    vTaskDelete( th_can_tx_loop_task );
    vTaskDelete( th_logging_loop_task );
    vTaskDelete( th_wifi_loop_task );
-   vTaskDelete( th_adc_loop_task );
+   vTaskDelete( th_serial_loop_task );
 }
 
 
@@ -374,12 +394,131 @@ void loop() {
   vTaskDelay(10);
 }
 
+void serial_loop(void* task_time_us) {
+  Serial2.begin(38400, SERIAL_8N2, HEADUNIT_RX_PIN, HEADUNIT_TX_PIN );
+  int local_timer = 0;
+  while (true) {
+    vTaskDelay(10);
+    if (local_timer == 100) { // Send version to head unit every second
+      local_timer = 0;
+      char candecoder_version[] = {0x2e,0x30,0x11,0x50,0x45,0x4c,0x4c,0x45,0x2d,0x4c,0x45,0x41,0x46,0x2d,0x56,0x57,0x50,0x51,0x2d,0x31};
+      send_to_head_unit(candecoder_version,sizeof(candecoder_version));
+    }
+
+    if (cc_outside_temp != old_cc_outside_temp) {
+      Serial.printf("Temp:%f\n",cc_outside_temp);
+      old_cc_outside_temp = cc_outside_temp;
+      char vehicle_status[] = {0x2e,0x41,0x0d,0x02,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+      char temp_h = 0;
+      char temp_l = 0;
+      unsigned int t = std::trunc(cc_outside_temp * 10.0);
+      if (cc_outside_temp >= 0) {
+        temp_h = (t & 0xff00) > 8;
+        temp_l = t & 0xff;
+      }
+      if (cc_outside_temp < 0) {
+        t = -t;
+        temp_h = 255;
+        temp_l = 256 - t;
+      }
+      vehicle_status[10] = temp_h;
+      vehicle_status[11] = temp_l;
+      Serial.printf("TempH:%d,tempL:%d,l:%d\n",vehicle_status[10],vehicle_status[11],sizeof(vehicle_status));
+      send_to_head_unit(vehicle_status, 16);
+// cansend can0 54C#0000000000604000
+    }
+    if ( (cc_fan_status != old_cc_fan_status) || (cc_fan_speed != old_cc_fan_speed) || (cc_fan_target != old_cc_fan_target) \
+     || (cc_fan_intake != old_cc_fan_intake) || (cc_set_temp != old_cc_set_temp) || (cc_rear_defrost != old_cc_rear_defrost) ) {
+      char cc_status[] = {0x2e,0x21,0x05,0x00,0x00,0x00,0x00,0x00};
+
+      switch (cc_fan_status) {
+        case 0x0a:
+          cc_status[3] |= 0x40; //ac
+          cc_status[3] |= 0x04; //dual
+          break;
+        case 0x76:
+          cc_status[3] |= 0x40; //ac
+          cc_status[3] |= 0x04; //dual
+          break;
+        case 0x78:
+          cc_status[3] |= 0x40; //ac
+          cc_status[3] |= 0x04; //dual
+          break;
+      }
+      cc_status[4] = cc_fan_speed & 0x07;
+
+      if (cc_rear_defrost == 1) {
+        cc_status[3] |= 0x01;
+      }
+
+      switch (cc_fan_intake)  {
+        case 0x09:
+          cc_status[3] |= 0x20; // recirculate
+          break;
+        case 0x12:
+          // s = "fresh air";
+          break;
+        case 0x92:
+          cc_status[3] |= 0x80; // defrost
+          cc_status[3] |= 0x02; // defrost
+          break;
+        case 0x00:
+          //s = "off";
+          break;
+      }
+
+      switch (cc_fan_target)  {
+        case 0x80:
+          break; // off
+        case 0x88:
+          cc_status[4] |= 0x40; // face
+          break;
+        case 0x90:
+          cc_status[4] |= 0x40; // face
+          cc_status[4] |= 0x20; // feet
+          break;
+        case 0x98:
+          cc_status[4] |= 0x20; // feet
+          break;
+        case 0xA0:
+          cc_status[4] |= 0x80; // windshield
+          cc_status[4] |= 0x20; // feet
+          break;
+        case 0xA8:
+          cc_status[4] |= 0x80; // windshield
+          break;
+      }
+
+      int set_temp = 0;
+      if (cc_set_temp < 18) {
+        set_temp = 0;
+      } else if (cc_set_temp > 26) {
+        set_temp = 31;
+      } else {
+        set_temp = 2 * (cc_set_temp - 18.0) + 1;
+      }
+      Serial.printf("set_t:%f, hu_t:%d,cc_status:%d\n",cc_set_temp,set_temp,cc_status[4]);
+      cc_status[5] = set_temp;
+      cc_status[6] = set_temp;
+      
+      send_to_head_unit(cc_status, 8);      
+      old_cc_fan_status = cc_fan_status;
+      old_cc_fan_speed = cc_fan_speed;
+      old_cc_fan_target = cc_fan_target;
+      old_cc_fan_intake = cc_fan_intake;
+      old_cc_set_temp = cc_set_temp;
+      old_cc_rear_defrost = cc_rear_defrost;
+    }
+
+    local_timer++;
+  }
+}
 
 void wifi_loop(void* task_time_us) {
   init_ap();
   init_webserver();
   while (true) {
-    vTaskDelay(2000);
+    vTaskDelay(1000);
     if (counter_retry_wlan > 0) {
       if (!wifi_connected()) {
         if (wlan_connect == 1) {
@@ -391,31 +530,48 @@ void wifi_loop(void* task_time_us) {
   }
 }
 
-void adc_loop(void* task_time_us) {
-
-  Serial.printf("Init AD converter\n");     
-  Wire.begin(I2C_SDA, I2C_SCL);
-  ADS.begin();
-  ADS.setGain(0);
-
-  while (true) {
-    vTaskDelay(100);
-
-    int16_t val_0 = ADS.readADC(0);  
-    int16_t val_1 = ADS.readADC(1);  
-    int16_t val_2 = ADS.readADC(2);  
-    int16_t val_3 = ADS.readADC(3);  
-
-    float f = ADS.toVoltage(1);  //  voltage factor
-
-    Serial.print("\tAnalog0: "); Serial.print(val_0); Serial.print('\t'); Serial.println(val_0 * f, 3);
-    Serial.print("\tAnalog1: "); Serial.print(val_1); Serial.print('\t'); Serial.println(val_1 * f, 3);
-    Serial.print("\tAnalog2: "); Serial.print(val_2); Serial.print('\t'); Serial.println(val_2 * f, 3);
-    Serial.print("\tAnalog3: "); Serial.print(val_3); Serial.print('\t'); Serial.println(val_3 * f, 3);
-    Serial.println();
+char head_unit_checksum(char data[], int len) {
+  int sum = 0;
+  for (int i = 1; i < len; i++) {
+    sum += data[i];
+    sum = sum & 0xff;
   }
+  sum = sum ^ 0xff;
+  char chksum = sum & 0xff;
+
+  return chksum;
 }
 
+void dump_to_hex(char data[],int data_len) {
+  Serial.printf("Dumping num chars::%d\n",data_len);
+  char hex_output[2 * data_len + 1];
+  int hex_index = 0;
+  char *hexdigits = "0123456789ABCDEF";
+  char *tmp[3];
+  for (int i = 0; i < data_len; i++)
+  {
+    char h = (data[i] & 0xf0) >> 4;
+    char l = data[i] & 0x0f;
+    hex_output[hex_index] = hexdigits[h];
+    hex_output[hex_index + 1] = hexdigits[l];
+    hex_index += 2;
+  }
+  hex_output[2 * data_len] = 0x00;
+  //Serial.printf("Serial hex frame length:%d\n",strlen(hex_output));
+  //Serial.printf("Sending to serial:%s\n",hex_output);
+}
+
+
+void send_to_head_unit(char data[],int data_len) {
+  int str_len = data_len + 1;
+  char data_new[data_len + 1];
+  memcpy(data_new,data,data_len);
+  char c = head_unit_checksum(data,data_len);
+  data_new[data_len] = c;
+//  dump_to_hex(data_new, str_len);
+//  Serial.printf("Serial frame length:%d,chksum:%x\n",str_len,c);
+  Serial2.write(data_new, data_len + 1);
+}
 
 void logging_loop(void* task_time_us) {
   unsigned long timestamp_prev_clear = 0;
@@ -826,15 +982,13 @@ void check_can_bus() {
         battery_type = LEAF_AZE0;
       }
       if (rx_frame.MsgID == 0x11a) { // Car status
-        // 2 = car off, 1 = car on, 0 = no data
-/*        int old_button = last_steering_wheel_button;
-        last_steering_wheel_button = rx_frame.data.u8[2];
-        if (last_steering_wheel_button != old_button) {
-          if (LOG_STEERING_WHEEL_BUTTON_CHANGES) {
-            logger("Buton change:" + String(last_steering_wheel_button));
-          }
+        gear = (rx_frame.data.u8[0] & 0xf0) >> 4;
+        if (gear == 2) {
+            digitalWrite(REVERSE_PIN,1);
+        } else {
+            digitalWrite(REVERSE_PIN,0);
         }
-*/
+
         int old_status_car = status_car;
         status_car = (rx_frame.data.u8[1] & 0xc0) >> 6;
         // Emulate TCU when car turns on
@@ -870,13 +1024,22 @@ void check_can_bus() {
         }
       }  
 
+      if (rx_frame.MsgID == 0x50a) { // VCM-Rear etc
+        old_cc_rear_defrost = cc_rear_defrost;
+        cc_rear_defrost = (rx_frame.data.u8[4] >> 7);
+        Serial.println(rx_frame.data.u8[4]);
+        Serial.println(cc_rear_defrost);
+      }
+
       if (rx_frame.MsgID == 0x54a) { // HVAC
         int TEMP = (rx_frame.data.u8[7]);
         if (TEMP != 0xff) {
+          old_cc_inside_temp = cc_inside_temp;
           cc_inside_temp = (TEMP - 40);
         }
         TEMP = (rx_frame.data.u8[4]);
         if (TEMP != 0x00) {
+          old_cc_set_temp = cc_set_temp;
           cc_set_temp = (0.5 * TEMP);
         }
       }
@@ -889,11 +1052,16 @@ void check_can_bus() {
       }
 
       if (rx_frame.MsgID == 0x54b) { // HVAC
-        cc_status = rx_frame.data.u8[1];
+        old_cc_fan_status = cc_fan_status;
+        old_cc_fan_target = cc_fan_target;
+        old_cc_fan_intake = cc_fan_intake;
+        old_cc_fan_speed = cc_fan_speed;
+
+        cc_fan_status = rx_frame.data.u8[1];
         cc_fan_target = rx_frame.data.u8[2];
         cc_fan_intake = rx_frame.data.u8[3];
-        cc_fanspeed = (rx_frame.data.u8[4] & 0x38) >> 3;
-        // Serial.printf("cc_status:%d\n",cc_status);
+        cc_fan_speed = (rx_frame.data.u8[4] & 0x38) >> 3;
+        // Serial.printf("cc_fan_status:%d\n",cc_fan_status);
       }
 
       if (rx_frame.MsgID == 0x55b) { // HVBAT, soc etc
@@ -1215,6 +1383,15 @@ void init_webserver() {
     request->send_P(200, "text/html", div_climate_html, processor);
   });
 
+  server.on("/carinfo", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", carinfo_html, processor);
+  });
+
+  server.on("/div_carinfo", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", div_carinfo_html, processor);
+  });
+
+
   server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* request) {
     html_message = "";
     request->send_P(200, "text/html", wifi_html, processor);
@@ -1382,30 +1559,30 @@ void init_webserver() {
 }
 
 bool cc_is_on() {
-  if ( (cc_status == 0x76) || (cc_status == 0x78) || (cc_status == 0x0a) ) {
+  if ( (cc_fan_status == 0x76) || (cc_fan_status == 0x78) || (cc_fan_status == 0x0a) ) {
     return true;
   }
   return false;
 }
 
-String get_string_for_cc_status(int cc_status) {
+String get_string_for_cc_fan_status(int cc_fan_status) {
   String s = "";
-  switch (cc_status) {
-  case 0x08:
-    s = "off";
-    break;
-  case 0x0a:
-    s = "remote on";
-    break;
-  case 0x76:
-    s = "auto";
-    break;
-  case 0x78:
-    s = "manual";
-    break;
-  default:
-    s = "unknown";
-    break;
+  switch (cc_fan_status) {
+    case 0x08:
+      s = "off";
+      break;
+    case 0x0a:
+      s = "remote on";
+      break;
+    case 0x76:
+      s = "auto";
+      break;
+    case 0x78:
+      s = "manual";
+      break;
+    default:
+      s = "unknown";
+      break;
   }
   return s;
 }
@@ -1468,7 +1645,7 @@ String get_string_for_cc_fan_intake(int cc_fan_intake) {
 String processor(const String& var)
 {
   if(var == "LINKS") {
-    String content = "<a href='/' class='button'>Overview</a>&nbsp;<a href='/timer' class='button'>Set timer</a>&nbsp;<a href='/clock' class='button'>Set clock</a>&nbsp;<a href='/climate' class='button'>Climate info</a>&nbsp;<a href='/control' class='button'>Manual Control</a>&nbsp;<a href='/wifi' class='button'>Wifi</a>&nbsp;<a href='/log' class='button'>Log</a><br><hr>";
+    String content = "<a href='/' class='button'>Overview</a>&nbsp;<a href='/timer' class='button'>Set timer</a>&nbsp;<a href='/clock' class='button'>Set clock</a>&nbsp;<a href='/climate' class='button'>Climate info</a>&nbsp;<a href='/carinfo' class='button'>Car info</a>&nbsp;<a href='/control' class='button'>Manual Control</a>&nbsp;<a href='/wifi' class='button'>Wifi</a>&nbsp;<a href='/log' class='button'>Log</a><br><hr>";
     return content;
   }
 
@@ -1484,20 +1661,34 @@ String processor(const String& var)
     String content = "";
     content += "Temp outside: " + String(cc_outside_temp) + "<br><br>";
     content += "Temp inside: " + String(cc_inside_temp) + "<br><br>";
-    String str_cc_status = "";
-    str_cc_status = get_string_for_cc_status(cc_status);
-    content += "CC status: " + str_cc_status + "<br><br>";
+    String str_cc_fan_status = "";
+    str_cc_fan_status = get_string_for_cc_fan_status(cc_fan_status);
+    content += "CC status: " + str_cc_fan_status + "<br><br>";
     content += "CC temp set: " + String(cc_set_temp) + "<br><br>";
-    content += "Fan speed: " + String(cc_fanspeed) + "<br><br>";
+    content += "Fan speed: " + String(cc_fan_speed) + "<br><br>";
     String str_cc_fan_target = "";
     str_cc_fan_target = get_string_for_cc_fan_target(cc_fan_target);
     content += "Fan target: " + str_cc_fan_target + "<br><br>";
     String str_cc_fan_intake = "";
     str_cc_fan_intake = get_string_for_cc_fan_intake(cc_fan_intake);
     content += "Fan intake: " + str_cc_fan_intake + "<br><br>";
+    content += "Rear defrost: " + String(cc_rear_defrost) + "<br><br>";
 
     return content;
   } 
+
+  if(var == "CARINFO") {
+    String content = "";
+    String str_gear = String(gear);
+    if (gear == 0) { str_gear = "Parked"; }
+    if (gear == 2) { str_gear = "Reverse"; }
+    if (gear == 3) { str_gear = "Neutral"; }
+    if (gear == 4) { str_gear = "Drive"; }
+
+    content += "Gear: " + str_gear + "<br><br>";
+    return content;
+  } 
+
 
   if(var == "CLOCK") {
     String content = "";
